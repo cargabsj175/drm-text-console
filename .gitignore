@@ -1,0 +1,13 @@
+# Binarios y artefactos de build
+/drm-text-console
+*.o
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Directorios de workspace hermano ya viven fuera del repo (../toolchain, etc.)

@@ -1,0 +1,75 @@
+#!/bin/sh
+#
+# S99testshell - Launch DRM text console for testing
+#
+
+LOG=/tmp/boot.log
+HB=/tmp/heartbeat.txt
+
+log() {
+    echo "[$(date)] $1" >> "$LOG"
+}
+
+hbinfo() {
+    echo "$1" >> "$HB" 2>/dev/null
+    for cand in /sdcard /mnt/sdcard /data; do
+        mountpoint -q "$cand" 2>/dev/null && cp "$HB" "$cand/heartbeat.txt" 2>/dev/null && sync
+    done
+}
+
+case "$1" in
+  start)
+    echo "=== S99testshell START $(date) ===" >> "$LOG"
+    log "UID=$(id)"
+    log "ls /dev/dri: $(ls /dev/dri/ 2>/dev/null)"
+    log "ls /dev/input: $(ls /dev/input/ 2>/dev/null)"
+    hbinfo "S99testshell: running"
+
+    # Wait for DRM card
+    i=0
+    while [ "$i" -lt 30 ]; do
+        [ -e /dev/dri/card0 ] && break
+        i=$((i+1))
+        sleep 0.5
+    done
+    log "DRM w/ card0: $([ -e /dev/dri/card0 ] && echo YES || echo NO)"
+    hbinfo "card0: $([ -e /dev/dri/card0 ] && echo YES || echo NO)"
+
+    # Wake the HDMI connector (best effort, no blocking)
+    [ -e /sys/class/drm/card0-HDMI-A-1/status ] && \
+        echo on > /sys/class/drm/card0-HDMI-A-1/status 2>/dev/null
+    log "HDMI status: $(cat /sys/class/drm/card0-HDMI-A-1/status 2>/dev/null || echo unknown)"
+    hbinfo "hdmi_status: $(cat /sys/class/drm/card0-HDMI-A-1/status 2>/dev/null || echo unknown)"
+
+    # Run drm-text-console. It runs indefinitely (menu loop). If it exits,
+    # record it and try again a few times instead of dropping to a blind sh.
+    retry=0
+    while [ "$retry" -lt 3 ]; do
+        log "Launching drm-text-console (attempt $((retry+1)))..."
+        hbinfo "--- attempt $((retry+1)) ---"
+        /usr/bin/drm-text-console >> "$LOG" 2>&1
+        RET=$?
+        log "drm-text-console EXIT CODE: $RET"
+        hbinfo "drm-text-console exit: $RET"
+        hbinfo "--- last log lines ---"
+        tail -n 20 "$LOG" >> "$HB" 2>/dev/null
+        for cand in /sdcard /mnt/sdcard /data; do
+            mountpoint -q "$cand" 2>/dev/null && cp "$HB" "$cand/heartbeat.txt" 2>/dev/null && sync
+        done
+        retry=$((retry+1))
+        sleep 1
+    done
+
+    log "All attempts failed. Last resort: /bin/sh"
+    hbinfo "dropping to /bin/sh"
+    exec /bin/sh < /dev/console > /dev/console 2>&1
+    ;;
+  stop)
+    killall -9 drm-text-console 2>/dev/null
+    ;;
+  *)
+    echo "Usage: $0 {start|stop}"
+    exit 1
+    ;;
+esac
+exit 0
