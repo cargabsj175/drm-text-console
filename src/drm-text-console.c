@@ -36,16 +36,20 @@
 
 /* --- Configuracion --- */
 #define BUILD_VSN   9
-#define TARGET_W    1280
-#define TARGET_H    720
+/* El modo ya no es fijo: se elige el mas cercano a 60 Hz, asi que el framebuffer
+ * puede ser 1920x1080 y no 1280x720. screen_w/H eran el tamano fijo de la
+ * rejilla y recortaban el dibujo a la esquina superior izquierda; ahora la
+ * rejilla se calcula del framebuffer real (screen_w/screen_h) y el font se
+ * escala para que se lea en una TV. */
 #define FONT_W      8
 #define FONT_H      16
-#define COLS        (TARGET_W / FONT_W)
-#define ROWS        (TARGET_H / FONT_H)
 #define DRM_DEV     "/dev/dri/card0"
 #define INPUT_GLOB  "/dev/input/"
 #define MAX_CMD     256
-#define MAX_OUTPUT  (ROWS * COLS)
+/* Antes era screen_rows*screen_cols, que al ser ya variables no puede ser macro. 32 KB
+ * cubren de sobra el peor caso: a 1920x1080 con escala 1 son 240x67 = 16080
+ * caracteres. */
+#define MAX_OUTPUT  32768
 
 /* --- Colores RGB565 --- */
 #define COLOR_BG        0x0000
@@ -169,6 +173,26 @@ static const unsigned char font_data[] = {
 static int drm_fd = -1;
 static uint32_t conn_id = 0, crtc_id = 0, fb_id = 0;
 static uint32_t width = 1280, height = 720;
+/* Rejilla real: se deriva del framebuffer, no de constantes. */
+static int screen_w = 1280, screen_h = 720;
+static int font_scale = 1, cell_w = FONT_W, cell_h = FONT_H;
+static int screen_cols = 160, screen_rows = 45;
+
+/* Calcula la rejilla a partir del modo elegido. El font se dobla a partir de
+ * 1600 px de ancho: a 1080p con el font de 8x16 el texto sale diminuto en una
+ * TV, y sin escalarlo el menu quedaria con 240 columnas de letra microscopica.
+ * A 720p se queda en 1, que es como estaba probado. */
+static void layout_setup(void) {
+    screen_w = (int)width;
+    screen_h = (int)height;
+    font_scale = (screen_w >= 1600) ? 2 : 1;
+    cell_w = FONT_W * font_scale;
+    cell_h = FONT_H * font_scale;
+    screen_cols = screen_w / cell_w;
+    screen_rows = screen_h / cell_h;
+    fprintf(stderr, "[drm] layout: %dx%d, font x%d -> celda %dx%d, rejilla %dx%d\n",
+            screen_w, screen_h, font_scale, cell_w, cell_h, screen_cols, screen_rows);
+}
 static drmModeModeInfo drm_mode;
 static drmModeRes *resources = NULL;
 static drmModeConnector *conn = NULL;
@@ -218,7 +242,7 @@ static inline uint32_t rgb565_to_xrgb(uint16_t c) {
 }
 
 static inline void put_pixel(int x, int y, uint16_t color) {
-    if (x < 0 || x >= TARGET_W || y < 0 || y >= TARGET_H) return;
+    if (x < 0 || x >= screen_w || y < 0 || y >= screen_h) return;
     if (fb_bpp == 32) {
         uint32_t *p = (uint32_t *)(fb_mem + (size_t)y * fb_pitch + (size_t)x * 4);
         *p = rgb565_to_xrgb(color);
@@ -229,8 +253,8 @@ static inline void put_pixel(int x, int y, uint16_t color) {
 }
 
 static void fill_rect(int x, int y, int w, int h, uint16_t color) {
-    for (int j = y; j < y + h && j < TARGET_H; j++)
-        for (int i = x; i < x + w && i < TARGET_W; i++)
+    for (int j = y; j < y + h && j < screen_h; j++)
+        for (int i = x; i < x + w && i < screen_w; i++)
             put_pixel(i, j, color);
 }
 
@@ -238,32 +262,36 @@ static void draw_char(int col, int row, char ch, uint16_t fg, uint16_t bg) {
     int idx = (unsigned char)ch - 0x20;
     if (idx < 0 || idx >= 96) idx = 0;
     const unsigned char *glyph = &font_data[idx * FONT_H];
-    int cx = col * FONT_W;
-    int cy = row * FONT_H;
+    int cx = col * cell_w;
+    int cy = row * cell_h;
     for (int y = 0; y < FONT_H; y++) {
         unsigned char bits = glyph[y];
         for (int x = 0; x < FONT_W; x++) {
             uint16_t c = (bits & (0x80 >> x)) ? fg : bg;
-            put_pixel(cx + x, cy + y, c);
+            if (font_scale == 1)
+                put_pixel(cx + x, cy + y, c);
+            else
+                fill_rect(cx + x * font_scale, cy + y * font_scale,
+                          font_scale, font_scale, c);
         }
     }
 }
 
 static void draw_string(int col, int row, const char *s, uint16_t fg, uint16_t bg) {
-    while (*s && col < COLS) {
+    while (*s && col < screen_cols) {
         draw_char(col++, row, *s++, fg, bg);
     }
 }
 
 static void draw_string_center(int row, const char *s, uint16_t fg, uint16_t bg) {
     int len = strlen(s);
-    int col = (COLS - len) / 2;
+    int col = (screen_cols - len) / 2;
     if (col < 0) col = 0;
     draw_string(col, row, s, fg, bg);
 }
 
 static void clear_screen(uint16_t bg) {
-    fill_rect(0, 0, TARGET_W, TARGET_H, bg);
+    fill_rect(0, 0, screen_w, screen_h, bg);
 }
 
 static void draw_box(int x, int y, int w, int h, uint16_t fg) {
@@ -358,7 +386,7 @@ static void draw_image_scaled(int x, int y, int dw, int dh,
 }
 
 static void draw_hline(int y, uint16_t color) {
-    for (int x = 0; x < TARGET_W; x++) put_pixel(x, y, color);
+    for (int x = 0; x < screen_w; x++) put_pixel(x, y, color);
 }
 
 /* --- DRM setup --- */
@@ -691,7 +719,7 @@ static void vt_diag(const char *tag) {
 static void run_vt_shell(void) {
     plog("[vt] switching to native VT shell via fbcon");
     clear_screen(COLOR_BG);
-    draw_string_center(ROWS / 2 - 1, "Switching to native VT console (fbcon)...",
+    draw_string_center(screen_rows / 2 - 1, "Switching to native VT console (fbcon)...",
                        COLOR_WARN, COLOR_BG);
     vt_diag("before");
 
@@ -903,14 +931,14 @@ static const char *menu_items[] = {
 static void draw_menu(void) {
     clear_screen(COLOR_BG);
     /* title bar */
-    fill_rect(0, 0, TARGET_W, FONT_H + 8, COLOR_TITLE);
+    fill_rect(0, 0, screen_w, cell_h + 8 * font_scale, COLOR_TITLE);
     draw_string_center(1, " GStick 4K Lite - RK3032 Test Console (v8) ", COLOR_BG, COLOR_TITLE);
-    draw_hline(FONT_H + 8, COLOR_FG);
+    draw_hline(cell_h + 8 * font_scale, COLOR_FG);
 
     int start_row = 3;
     for (int i = 0; i < MENU_COUNT; i++) {
         int row = start_row + i * 2;
-        char buf[COLS + 1];
+        char buf[screen_cols + 1];
         const char *label = menu_items[i];
         int sel = (i == menu_sel);
         uint16_t fg = sel ? COLOR_BG : COLOR_FG;
@@ -922,8 +950,8 @@ static void draw_menu(void) {
     }
 
     /* footer: input status + hints */
-    int fy = ROWS - 3;
-    draw_hline((fy - 1) * FONT_H, COLOR_DIM);
+    int fy = screen_rows - 3;
+    draw_hline((fy - 1) * cell_h, COLOR_DIM);
     draw_string(2, fy - 1, input_status, COLOR_OK, COLOR_BG);
     draw_string_center(fy, "[Up/Down] Move   [Enter] Select   [Esc] Back", COLOR_DIM, COLOR_BG);
 }
@@ -932,14 +960,14 @@ static void show_cpu_mem(void) {
     char buf[MAX_OUTPUT];
     clear_screen(COLOR_BG);
     draw_string(1, 0, "== CPU / Memory ==", COLOR_TITLE, COLOR_BG);
-    draw_hline(FONT_H, COLOR_DIM);
+    draw_hline(cell_h, COLOR_DIM);
     run_cmd("cat /proc/cpuinfo | grep -E 'Processor|model name|BogoMIPS|Features' | head -8", buf, sizeof(buf));
     int row = 2;
     char *p = buf;
-    while (*p && row < ROWS - 12) {
-        char line[COLS + 1];
+    while (*p && row < screen_rows - 12) {
+        char line[screen_cols + 1];
         int i = 0;
-        while (*p && *p != '\n' && i < COLS) line[i++] = *p++;
+        while (*p && *p != '\n' && i < screen_cols) line[i++] = *p++;
         line[i] = 0;
         if (*p == '\n') p++;
         draw_string(1, row++, line, COLOR_FG, COLOR_BG);
@@ -948,68 +976,68 @@ static void show_cpu_mem(void) {
     draw_string(1, row++, "-- Memory --", COLOR_TITLE, COLOR_BG);
     run_cmd("free -h", buf, sizeof(buf));
     p = buf;
-    while (*p && row < ROWS - 2) {
-        char line[COLS + 1];
+    while (*p && row < screen_rows - 2) {
+        char line[screen_cols + 1];
         int i = 0;
-        while (*p && *p != '\n' && i < COLS) line[i++] = *p++;
+        while (*p && *p != '\n' && i < screen_cols) line[i++] = *p++;
         line[i] = 0;
         if (*p == '\n') p++;
         draw_string(1, row++, line, COLOR_FG, COLOR_BG);
     }
-    draw_string_center(ROWS - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
 }
 
 static void show_storage(void) {
     char buf[MAX_OUTPUT];
     clear_screen(COLOR_BG);
     draw_string(1, 0, "== Storage ==", COLOR_TITLE, COLOR_BG);
-    draw_hline(FONT_H, COLOR_DIM);
+    draw_hline(cell_h, COLOR_DIM);
     run_cmd("df -h", buf, sizeof(buf));
     int row = 2;
     char *p = buf;
-    while (*p && row < ROWS - 2) {
-        char line[COLS + 1];
+    while (*p && row < screen_rows - 2) {
+        char line[screen_cols + 1];
         int i = 0;
-        while (*p && *p != '\n' && i < COLS) line[i++] = *p++;
+        while (*p && *p != '\n' && i < screen_cols) line[i++] = *p++;
         line[i] = 0;
         if (*p == '\n') p++;
         draw_string(1, row++, line, COLOR_FG, COLOR_BG);
     }
-    draw_string_center(ROWS - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
 }
 
 static void show_network(void) {
     char buf[MAX_OUTPUT];
     clear_screen(COLOR_BG);
     draw_string(1, 0, "== Network ==", COLOR_TITLE, COLOR_BG);
-    draw_hline(FONT_H, COLOR_DIM);
+    draw_hline(cell_h, COLOR_DIM);
     run_cmd("ip addr show 2>/dev/null || ifconfig 2>/dev/null", buf, sizeof(buf));
     int row = 2;
     char *p = buf;
-    while (*p && row < ROWS - 2) {
-        char line[COLS + 1];
+    while (*p && row < screen_rows - 2) {
+        char line[screen_cols + 1];
         int i = 0;
-        while (*p && *p != '\n' && i < COLS) line[i++] = *p++;
+        while (*p && *p != '\n' && i < screen_cols) line[i++] = *p++;
         line[i] = 0;
         if (*p == '\n') p++;
         draw_string(1, row++, line, COLOR_FG, COLOR_BG);
     }
-    draw_string_center(ROWS - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
 }
 
 static void show_gpu_drm(void) {
     char buf[MAX_OUTPUT];
     clear_screen(COLOR_BG);
     draw_string(1, 0, "== GPU / DRM ==", COLOR_TITLE, COLOR_BG);
-    draw_hline(FONT_H, COLOR_DIM);
+    draw_hline(cell_h, COLOR_DIM);
     run_cmd("ls /dev/dri/ 2>/dev/null", buf, sizeof(buf));
     int row = 2;
     draw_string(1, row++, "DRM devices:", COLOR_OK, COLOR_BG);
     char *p = buf;
-    while (*p && row < ROWS - 14) {
-        char line[COLS + 1];
+    while (*p && row < screen_rows - 14) {
+        char line[screen_cols + 1];
         int i = 0;
-        while (*p && *p != '\n' && i < COLS) line[i++] = *p++;
+        while (*p && *p != '\n' && i < screen_cols) line[i++] = *p++;
         line[i] = 0;
         if (*p == '\n') p++;
         draw_string(3, row++, line, COLOR_FG, COLOR_BG);
@@ -1029,30 +1057,30 @@ static void show_gpu_drm(void) {
         row++;
         draw_string(1, row++, "Mali GPU:", COLOR_OK, COLOR_BG);
         p = buf;
-        while (*p && row < ROWS - 2) {
-            char line[COLS + 1];
+        while (*p && row < screen_rows - 2) {
+            char line[screen_cols + 1];
             int i = 0;
-            while (*p && *p != '\n' && i < COLS) line[i++] = *p++;
+            while (*p && *p != '\n' && i < screen_cols) line[i++] = *p++;
             line[i] = 0;
             if (*p == '\n') p++;
             draw_string(3, row++, line, COLOR_FG, COLOR_BG);
         }
     }
-    draw_string_center(ROWS - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
 }
 
 static void show_input_devices(void) {
     char buf[MAX_OUTPUT];
     clear_screen(COLOR_BG);
     draw_string(1, 0, "== Input Devices ==", COLOR_TITLE, COLOR_BG);
-    draw_hline(FONT_H, COLOR_DIM);
+    draw_hline(cell_h, COLOR_DIM);
     run_cmd("ls -la /dev/input/ 2>/dev/null", buf, sizeof(buf));
     int row = 2;
     char *p = buf;
-    while (*p && row < ROWS / 2 - 2) {
-        char line[COLS + 1];
+    while (*p && row < screen_rows / 2 - 2) {
+        char line[screen_cols + 1];
         int i = 0;
-        while (*p && *p != '\n' && i < COLS) line[i++] = *p++;
+        while (*p && *p != '\n' && i < screen_cols) line[i++] = *p++;
         line[i] = 0;
         if (*p == '\n') p++;
         draw_string(1, row++, line, COLOR_FG, COLOR_BG);
@@ -1063,45 +1091,45 @@ static void show_input_devices(void) {
     DIR *d = opendir("/sys/class/input");
     if (d) {
         struct dirent *de;
-        while ((de = readdir(d)) != NULL && row < ROWS - 3) {
+        while ((de = readdir(d)) != NULL && row < screen_rows - 3) {
             if (strncmp(de->d_name, "event", 5) != 0) continue;
             char namepath[256], name[128] = "?";
             snprintf(namepath, sizeof(namepath),
                      "/sys/class/input/%s/device/name", de->d_name);
             FILE *f = fopen(namepath, "r");
             if (f) { if (fgets(name, sizeof(name), f)) name[strcspn(name, "\n")] = 0; fclose(f); }
-            char line[COLS + 1];
+            char line[screen_cols + 1];
             snprintf(line, sizeof(line), "  %s: %s", de->d_name, name);
             draw_string(1, row++, line, COLOR_FG, COLOR_BG);
         }
         closedir(d);
     }
-    draw_string_center(ROWS - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
 }
 
 static void show_boot_log(void) {
     char buf[MAX_OUTPUT];
     clear_screen(COLOR_BG);
     draw_string(1, 0, "== Boot Log (dmesg) ==", COLOR_TITLE, COLOR_BG);
-    draw_hline(FONT_H, COLOR_DIM);
+    draw_hline(cell_h, COLOR_DIM);
     run_cmd("dmesg | tail -38", buf, sizeof(buf));
     int row = 2;
     char *p = buf;
-    while (*p && row < ROWS - 2) {
-        char line[COLS + 1];
+    while (*p && row < screen_rows - 2) {
+        char line[screen_cols + 1];
         int i = 0;
-        while (*p && *p != '\n' && i < COLS) line[i++] = *p++;
+        while (*p && *p != '\n' && i < screen_cols) line[i++] = *p++;
         line[i] = 0;
         if (*p == '\n') p++;
         draw_string(1, row++, line, COLOR_FG, COLOR_BG);
     }
-    draw_string_center(ROWS - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
 }
 
 static void show_about(void) {
     clear_screen(COLOR_BG);
     draw_string(1, 0, "== About / Credits ==", COLOR_TITLE, COLOR_BG);
-    draw_hline(FONT_H, COLOR_DIM);
+    draw_hline(cell_h, COLOR_DIM);
     static const char *lines[] = {
         "GStick 4K Lite - RK3032 test console",
         "",
@@ -1121,7 +1149,7 @@ static void show_about(void) {
     int row = 2;
     for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++)
         draw_string(2, row++, lines[i], COLOR_FG, COLOR_BG);
-    draw_string_center(ROWS - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
 }
 
 /* Launch any program under DRM: drop master, exec, wait, re-acquire.
@@ -1129,10 +1157,10 @@ static void show_about(void) {
 static void run_exec(char *const argv[]) {
     plog("[run] launching: %s", argv[0]);
     clear_screen(COLOR_BG);
-    char splash[COLS + 1];
+    char splash[screen_cols + 1];
     snprintf(splash, sizeof(splash), "Launching %s ...", argv[0]);
-    draw_string_center(ROWS / 2 - 1, splash, COLOR_WARN, COLOR_BG);
-    draw_string_center(ROWS / 2 + 1, "When it exits you return to the console", COLOR_DIM, COLOR_BG);
+    draw_string_center(screen_rows / 2 - 1, splash, COLOR_WARN, COLOR_BG);
+    draw_string_center(screen_rows / 2 + 1, "When it exits you return to the console", COLOR_DIM, COLOR_BG);
     drmDropMaster(drm_fd);
 
     /* RetroArch's linuxraw input driver starts with isatty(0) and aborts with
@@ -1535,10 +1563,10 @@ static void game_menu(void) {
     if (game_count == 0) game_load();
     if (game_count <= 0) {
         clear_screen(COLOR_BG);
-        draw_box(0, 0, TARGET_W, TARGET_H, COLOR_FG);
-        draw_string_center(ROWS / 2 - 2, "No games found in:", COLOR_WARN, COLOR_BG);
-        draw_string_center(ROWS / 2, GAME_CFG, COLOR_FG, COLOR_BG);
-        draw_string_center(ROWS / 2 + 1, "Edit the file or press any key", COLOR_DIM, COLOR_BG);
+        draw_box(0, 0, screen_w, screen_h, COLOR_FG);
+        draw_string_center(screen_rows / 2 - 2, "No games found in:", COLOR_WARN, COLOR_BG);
+        draw_string_center(screen_rows / 2, GAME_CFG, COLOR_FG, COLOR_BG);
+        draw_string_center(screen_rows / 2 + 1, "Edit the file or press any key", COLOR_DIM, COLOR_BG);
         while (running) {
             if (read_key() >= 0) break;
             usleep(20000);
@@ -1550,25 +1578,25 @@ static void game_menu(void) {
     int page = 0, sel = 0;
     while (running) {
         clear_screen(COLOR_BG);
-        fill_rect(0, 0, TARGET_W, FONT_H + 8, COLOR_TITLE);
-        char title[COLS + 1];
+        fill_rect(0, 0, screen_w, cell_h + 8 * font_scale, COLOR_TITLE);
+        char title[screen_cols + 1];
         snprintf(title, sizeof(title), " Game Menu - %d games (page %d/%d) ",
                  game_count, page + 1, pages);
         draw_string_center(1, title, COLOR_BG, COLOR_TITLE);
-        draw_hline(FONT_H + 8, COLOR_FG);
+        draw_hline(cell_h + 8 * font_scale, COLOR_FG);
 
         int first = page * GAME_PAGE;
         int row = 3;
         for (int i = 0; i < GAME_PAGE && first + i < game_count; i++) {
             int idx = first + i;
             int is_sel = (idx == sel);
-            char padding[COLS + 1];
+            char padding[screen_cols + 1];
             snprintf(padding, sizeof(padding), "%c %-34s",
                      is_sel ? '>' : ' ', game_name[idx]);
             draw_string(2, row++, padding,
                         is_sel ? COLOR_BG : COLOR_FG,
                         is_sel ? COLOR_HL : COLOR_BG);
-            char meta[COLS + 1];
+            char meta[screen_cols + 1];
             snprintf(meta, sizeof(meta), "%s %s",
                      game_cmd[idx][0] ? "CMD" : "RA ",
                      game_cmd[idx][0] ? game_cmd[idx] : game_core[idx]);
@@ -1577,20 +1605,20 @@ static void game_menu(void) {
 
         /* thumbnail panel: generic per-system image for the selected entry */
         {
-            int tx = TARGET_W - 380;
+            int tx = screen_w - 380;
             int ty = 60;
             int tw = 340, th = 300;
             fill_rect(tx, ty, tw, th, COLOR_HL);
             draw_box(tx - 2, ty - 2, tw + 4, th + 4, COLOR_FG);
             draw_entry_thumb(sel, tx, ty, tw, th);
-            char tname[COLS + 1];
+            char tname[screen_cols + 1];
             snprintf(tname, sizeof(tname), " %s ", game_name[sel]);
-            draw_string(tx / FONT_W, (ty + th) / FONT_H + 1, tname,
+            draw_string(tx / cell_w, (ty + th) / cell_h + 1, tname,
                         COLOR_FG, COLOR_BG);
         }
-        char hint[COLS + 1];
+        char hint[screen_cols + 1];
         snprintf(hint, sizeof(hint), "[Up/Down] Move  [PgUp/PgDn] Page  [Enter] Launch  [Esc] Back");
-        draw_string_center(ROWS - 1, hint, COLOR_DIM, COLOR_BG);
+        draw_string_center(screen_rows - 1, hint, COLOR_DIM, COLOR_BG);
 
         int k = -1;
         while (k < 0 && running) { k = read_key(); usleep(20000); }
@@ -1654,6 +1682,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (find_connector() < 0) { cleanup_drm(); return 1; }
+    layout_setup();
     if (create_framebuffer() < 0) { cleanup_drm(); return 1; }
 
     /* Open input */
