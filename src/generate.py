@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
-"""Generate drm-text-console.c with embedded VGA 8x16 font."""
+"""Generaba drm-text-console.c con la fuente VGA 8x16 embebida.
+
+AVISO: esto es una reliquia. La C_SOURCE de aqui se quedo atrasada hace tiempo
+(727 lineas) y el drm-text-console.c de verdad se ha developed a mano desde
+entonces (2135 lineas: selector de modo a 60 Hz, listado de modos del conector,
+argv corregido, log de senales, menu de juegos...). Si se ejecuta, machaca el
+launcher entero y lo deja sin esas cosas sin avisar. Ya ha pasado una vez.
+
+Por eso ahora no escribe nada salvo que se pase --force, y avisa de que el
+resultado esta obsoleto. Para sacar la fuente de la consola:
+    wc -c drm-text-console.c
+"""
 import os
+import sys
 
 # Standard VGA CP437 8x16 font - first 96 printable ASCII chars (0x20-0x7F)
 # Each char is 16 bytes (16 rows, bit 7 = leftmost pixel)
@@ -847,6 +859,15 @@ def main():
 
     outdir = os.path.dirname(os.path.abspath(__file__))
     outpath = os.path.join(outdir, 'drm-text-console.c')
+    if os.path.exists(outpath) and '--force' not in sys.argv:
+        print("NO SE ESCRIBE NADA. drm-text-console.c existe y este script lo "
+              "machacaria con una version obsoleta de la consola (se quedo en "
+              "%d lineas; el fichero real tiene %d). Pasa --force si de verdad "
+              "quieres perder los cambios." %
+              (c_src.count(chr(10)),
+               open(outpath, encoding='utf-8').read().count(chr(10))))
+        return
+    print("AVISO: se va a escribir una consola obsoleta (%d lineas)." % c_src.count(chr(10)))
     with open(outpath, 'w') as f:
         f.write(c_src)
     print(f"Generated {outpath} ({len(c_src)} bytes)")

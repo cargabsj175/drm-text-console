@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <poll.h>
+#include <termios.h>
 #include <linux/input.h>
 #include <stdarg.h>
 #include <xf86drm.h>
@@ -370,7 +371,28 @@ static int find_connector(void) {
         if (!conn) continue;
         if (conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0) {
             conn_id = conn->connector_id;
-            drm_mode = conn->modes[0];
+            /* neonatox: se elige el modo mas cercano a 60 Hz en vez de modes[0].
+             * Motivo medido: el ritmo lo marca la pantalla, no el driver. Con el
+             * modo que daba modes[0] (1280x720 @ 50 Hz) un core de 60 fps iba a
+             * 50 fps, o sea al 83% de velocidad, con el driver perfecto
+             * (fps=50.0 de 50 = 100% del modo). En este conector no hay 720p a
+             * 60 Hz, asi que sube a 1920x1080 @ 60 Hz, que es lo que ofrece.
+             * No encarece nada: el plano del juego sigue siendo 352x224 y lo
+             * escala el VOP en hardware, asi que ni el blit ni los buffers
+             * cambian de tamano. A igualdad de Hz se queda con el mas grande. */
+            {
+                int best = 0;
+                for (int m = 0; m < conn->count_modes; m++) {
+                    int d_new = abs(conn->modes[m].vrefresh - 60);
+                    int d_old = abs(conn->modes[best].vrefresh - 60);
+                    if (d_new < d_old ||
+                        (d_new == d_old &&
+                         conn->modes[m].hdisplay * conn->modes[m].vdisplay >
+                         conn->modes[best].hdisplay * conn->modes[best].vdisplay))
+                        best = m;
+                }
+                drm_mode = conn->modes[best];
+            }
             width = drm_mode.hdisplay;
             height = drm_mode.vdisplay;
             /* find encoder/crtc */
@@ -387,8 +409,18 @@ static int find_connector(void) {
                 if (resources->count_crtcs > 0)
                     crtc_id = resources->crtcs[0];
             }
-            fprintf(stderr, "[drm] Connector %u: %dx%d %s\n",
-                    conn_id, width, height, drm_mode.name);
+            fprintf(stderr, "[drm] Connector %u: %dx%d %s (%d Hz)\n",
+                    conn_id, width, height, drm_mode.name, drm_mode.vrefresh);
+            /* Todos los modos del conector. Se elige modes[0] tal cual, pero
+             * la TV negocia 720p a 50 Hz y los cores piden 60 fps, asi que un
+             * 50 Hz da el 83% de velocidad aunque el driver vaya perfecto.
+             * Hace falta ver que modos de 60 Hz ofrece de verdad antes de
+             * elegir uno: no se puede suponer. */
+            for (int m = 0; m < conn->count_modes; m++)
+                fprintf(stderr, "[drm] mode[%d] %s %dx%d @ %d Hz (clock %d)\n",
+                        m, conn->modes[m].name,
+                        conn->modes[m].hdisplay, conn->modes[m].vdisplay,
+                        conn->modes[m].vrefresh, conn->modes[m].clock);
             return 0;
         }
         drmModeFreeConnector(conn);
@@ -562,7 +594,6 @@ static int input_absaxis[MX_INPUT];  /* 1 if we may use ABS_X/ABS_Y (gamepad) */
 static int input_count = 0;
 static char input_names[MX_INPUT][48];
 static int last_ev_type = -1, last_ev_code = -1, last_ev_val = 0;
-static int ev_count = 0;
 static char input_status[96] = "waiting...";
 
 /* virtual key codes returned by read_key() */
@@ -615,33 +646,6 @@ static int map_key(const struct input_event *ev, int from_absaxis) {
     return -1;
 }
 
-/* Printable ASCII mapping for shell line editing. evdev key codes are NOT
- * alphabetical (KEY_Q=16..KEY_P=25, KEY_A=30..KEY_L=38, KEY_Z=44..KEY_M=50),
- * so we use an explicit QWERTY layout table. */
-static char key_to_ascii(unsigned int code) {
-    static const char qwerty[0x80] = {
-        [KEY_Q]='q',[KEY_W]='w',[KEY_E]='e',[KEY_R]='r',[KEY_T]='t',
-        [KEY_Y]='y',[KEY_U]='u',[KEY_I]='i',[KEY_O]='o',[KEY_P]='p',
-        [KEY_A]='a',[KEY_S]='s',[KEY_D]='d',[KEY_F]='f',[KEY_G]='g',
-        [KEY_H]='h',[KEY_J]='j',[KEY_K]='k',[KEY_L]='l',
-        [KEY_Z]='z',[KEY_X]='x',[KEY_C]='c',[KEY_V]='v',[KEY_B]='b',
-        [KEY_N]='n',[KEY_M]='m',
-        [KEY_1]='1',[KEY_2]='2',[KEY_3]='3',[KEY_4]='4',[KEY_5]='5',
-        [KEY_6]='6',[KEY_7]='7',[KEY_8]='8',[KEY_9]='9',[KEY_0]='0',
-        [KEY_SPACE]=' ',[KEY_MINUS]='-',[KEY_EQUAL]='=',
-        [KEY_LEFTBRACE]='[',[KEY_RIGHTBRACE]=']',[KEY_BACKSLASH]='\\',
-        [KEY_SEMICOLON]=';',[KEY_APOSTROPHE]='\'',[KEY_GRAVE]='`',
-        [KEY_COMMA]=',',[KEY_DOT]='.',[KEY_SLASH]='/',
-        [KEY_TAB]='\t',[KEY_BACKSPACE]='\b',
-        [KEY_ENTER]='\n',[KEY_KPENTER]='\n',
-        [KEY_KP1]='1',[KEY_KP2]='2',[KEY_KP3]='3',[KEY_KP4]='4',[KEY_KP5]='5',
-        [KEY_KP6]='6',[KEY_KP7]='7',[KEY_KP8]='8',[KEY_KP9]='9',[KEY_KP0]='0',
-        [KEY_KPMINUS]='-',[KEY_KPPLUS]='+',[KEY_KPDOT]='.',[KEY_KPSLASH]='/',
-        [KEY_KPASTERISK]='*',
-    };
-    if (code < sizeof(qwerty)) return qwerty[code];
-    return 0;
-}
 
 static void log_caps(int fd, const char *path) {
     unsigned long bits[64] = {0};
@@ -669,300 +673,11 @@ static void log_caps(int fd, const char *path) {
     }
 }
 
-/* --- Embedded shell (sh via pipes rendered to the DRM framebuffer) --- */
-#define SHELL_BUF_MAX 256
-static char shell_line[SHELL_BUF_MAX];
-static int  shell_len = 0;
-#define SHBUF_MAX (ROWS * COLS * 2)   /* ring of rendered text */
-#define SH_MARG_X  2                   /* left/right margin (chars) */
-#define SH_MARG_Y  2                   /* top margin rows */
-#define SH_USABLE  (COLS - 4 * SH_MARG_X)   /* usable text width */
-static char sh_line_buf[SHBUF_MAX];
-static int  sh_line_used = 0;
-static int  sh_dirty = 1;      /* redraw only when content changes */
-static pid_t sh_pid = -1;
-static int  sh_tty_out = -1, sh_tty_in = -1;
-
-static void sh_reset_buffer(void) {
-    sh_line_used = 0;
-    memset(sh_line_buf, 0, sizeof(sh_line_buf));
-    sh_dirty = 1;
-}
-
-static void sh_append(const char *s, int n) {
-    if (n <= 0) return;
-    if (sh_line_used + n >= (int)sizeof(sh_line_buf)) {
-        int keep = (int)sizeof(sh_line_buf) - 1 - n;
-        if (keep > 0) memmove(sh_line_buf, sh_line_buf + sh_line_used - keep, keep);
-        sh_line_used = keep;
-    }
-    memcpy(sh_line_buf + sh_line_used, s, n);
-    sh_line_used += n;
-    sh_dirty = 1;
-}
-
-/* word wrap a line at the usable width and draw with margins:
- * returns number of screen rows consumed */
-static int sh_draw_wrap(int row, const char *s) {
-    int rows = 0;
-    while (*s && row < ROWS - 4) {
-        int n = 0;
-        while (s[n] && s[n] != '\n' && n < SH_USABLE) n++;
-        char tmp[SH_USABLE + 1];
-        memcpy(tmp, s, n); tmp[n] = 0;
-        if (n > 0) draw_string(SH_MARG_X, row, tmp, COLOR_FG, COLOR_BG);
-        rows++;
-        row++;
-        s += n;
-        if (*s == '\n') { s++; if (!*s) break; }
-    }
-    return rows;
-}
-
-static void sh_draw(void) {
-    clear_screen(COLOR_BG);
-    draw_box(0, 0, TARGET_W, TARGET_H, COLOR_FG);      /* white border */
-    draw_box(1, 1, TARGET_W - 2, TARGET_H - 2, COLOR_FG);
-    fill_rect(0, 0, TARGET_W, FONT_H + 8, COLOR_TITLE);
-    draw_string_center(1, " Shell (embedded /bin/sh)  [Enter] sends  [Tab] completes  [Esc] back ",
-                       COLOR_BG, COLOR_TITLE);
-    draw_hline(FONT_H + 8, COLOR_FG);
-
-    /* render scrollback lines with margins and word wrap */
-    int out_lines = ROWS - 6;
-    char *p = sh_line_buf;
-    char *endcur = sh_line_buf + sh_line_used;
-    int start = 0;
-    if (sh_line_used >= sizeof(sh_line_buf)) start = 1;
-    (void)out_lines;
-    int row = SH_MARG_Y + 2;
-    /* split into lines */
-    char *lines[out_lines + 1];
-    int nlines = 0;
-    while (p < endcur && nlines < out_lines) {
-        lines[nlines++] = p;
-        char *nl = memchr(p, '\n', endcur - p);
-        if (nl) { *nl = '\0'; p = nl + 1; }
-        else { p = endcur; break; }
-    }
-    int lastrow = 0;
-    for (int i = 0; i < nlines; i++) lastrow = sh_draw_wrap(row, lines[i]);
-    (void)lastrow; (void)start;
-
-    /* prompt line at bottom */
-    char prompt[COLS * 2 + 1];
-    snprintf(prompt, sizeof(prompt), "# %s", shell_line);
-    sh_draw_wrap(ROWS - 3, prompt);
-    draw_string(SH_MARG_X, ROWS - 1, "[Enter] run  [Tab] autocomplete  [Esc] back to menu",
-                COLOR_DIM, COLOR_BG);
-}
-
-/* simple filename/command autocompletion: expand the current word using PATH
- * and the current directory; single match completes, several list matches */
-static int sh_complete(void) {
-    if (shell_len <= 0) return 0;
-    int ws = shell_len - 1;
-    while (ws > 0 && shell_line[ws] != ' ' && shell_line[ws] != '\t') ws--;
-    if (shell_line[ws] == ' ' || shell_line[ws] == '\t') ws++;
-    int wlen = shell_len - ws;
-    if (wlen <= 0) return 0;
-    char word[512];
-    memcpy(word, shell_line + ws, wlen);
-    word[wlen] = 0;
-
-    const char *dirs[16];
-    int ndirs = 0;
-    dirs[ndirs++] = ".";
-    const char *path = getenv("PATH");
-    char pathbuf[1024];
-    if (path) {
-        snprintf(pathbuf, sizeof(pathbuf), "%s", path);
-        char *tok = strtok(pathbuf, ":");
-        while (tok && ndirs < 15) { if (tok[0]) dirs[ndirs++] = tok; tok = strtok(NULL, ":"); }
-    }
-
-    char matches[64][256];
-    int nm = 0;
-    for (int d = 0; d < ndirs && nm < 64; d++) {
-        DIR *dir = opendir(dirs[d]);
-        if (!dir) continue;
-        struct dirent *de;
-        while ((de = readdir(dir)) && nm < 64) {
-            if (strncmp(de->d_name, word, wlen) == 0) {
-                int n = snprintf(matches[nm], sizeof(matches[nm]), "%s/%s",
-                                 (strcmp(dirs[d], ".") == 0) ? "" : dirs[d], de->d_name);
-                if (de->d_type == DT_DIR) matches[nm][n] = '/';
-                nm++;
-            }
-        }
-        closedir(dir);
-    }
-    if (nm == 0) return 0;
-
-    if (nm == 1) {
-        char *m = matches[0];
-        if (m[0] && m[1] != '/') m++;          /* strip leading "/" */
-        int mlen = strlen(m);
-        if (shell_len + mlen - wlen < SHELL_BUF_MAX - 1) {
-            memcpy(shell_line + shell_len - wlen, m + wlen, mlen - wlen + 1);
-            shell_len = shell_len - wlen + mlen;
-            sh_dirty = 1;
-        }
-        return 1;
-    }
-    /* several: find common prefix and list candidates */
-    int maxmatch = 0, minmatch = 256;
-    for (int i = 0; i < nm; i++) {
-        int l = strlen(matches[i]);
-        if (l > maxmatch) maxmatch = l;
-        if (l < minmatch) minmatch = l;
-    }
-    int pref = minmatch;
-    for (int i = 0; i < pref; i++) {
-        char c = matches[0][i];
-        for (int j = 1; j < nm; j++)
-            if (matches[j][i] != c) { pref = i; goto done; }
-    }
-done:
-    if (pref > wlen) {
-        char *m = matches[0];
-        if (m[0] && m[1] != '/') m++;
-        if (shell_len + pref - wlen < SHELL_BUF_MAX - 1) {
-            memcpy(shell_line + shell_len - wlen, m + wlen, pref - wlen);
-            shell_len = shell_len - wlen + pref;
-            shell_line[shell_len] = 0;
-        }
-    }
-    char list[1024]; int ln = 0;
-    ln += snprintf(list + ln, sizeof(list) - ln, "\n");
-    for (int i = 0; i < nm && nm > 1; i++)
-        ln += snprintf(list + ln, sizeof(list) - ln, "  %s", matches[i]);
-    sh_append(list, ln);
-    sh_append("\n", 1);
-    sh_dirty = 1;
-    return 1;
-}
-
-static int sh_run_command(void) {
-    if (sh_pid < 0) return -1;
-    if (shell_len <= 0) return 0;
-    char buf[SHELL_BUF_MAX + 2];
-    snprintf(buf, sizeof(buf), "%s\n", shell_line);
-    ssize_t w = write(sh_tty_in, buf, strlen(buf));
-    if (w < 0) plog("[sh] write cmd failed: %s", strerror(errno));
-    sh_append(shell_line, shell_len);
-    sh_append("\n", 1);
-    shell_len = 0;
-    shell_line[0] = 0;
-    sh_dirty = 1;
-    return 0;
-}
-
-static void run_shell(void) {
-    sh_reset_buffer();
-    shell_len = 0;
-    shell_line[0] = 0;
-
-    int pin[2], pout[2];
-    if (pipe(pin) < 0 || pipe(pout) < 0) {
-        plog("[sh] pipe failed: %s", strerror(errno));
-        return;
-    }
-    pid_t pid = fork();
-    if (pid < 0) {
-        plog("[sh] fork failed: %s", strerror(errno));
-        return;
-    }
-    if (pid == 0) {
-        /* child: /bin/sh with stdin/stdout/stderr wired to pipes */
-        dup2(pin[0], 0);
-        dup2(pout[1], 1);
-        dup2(pout[1], 2);
-        close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]);
-        execl("/bin/sh", "/bin/sh", NULL);
-        _exit(127);
-    }
-    close(pin[0]); close(pout[1]);
-    sh_tty_out = pout[0];
-    sh_tty_in  = pin[1];
-    sh_pid = pid;
-    fcntl(sh_tty_out, F_SETFL, fcntl(sh_tty_out, F_GETFL) | O_NONBLOCK);
-    plog("[sh] shell pid %d", pid);
-
-    time_t idle_start = time(NULL);
-    int  was_alive = 1;
-    while (running) {
-        struct pollfd pfds[1 + MX_INPUT];
-        pfds[0].fd = sh_tty_out;
-        pfds[0].events = POLLIN;
-        for (int i = 0; i < input_count; i++) {
-            pfds[i + 1].fd = input_fds[i];
-            pfds[i + 1].events = POLLIN;
-        }
-        int pr = poll(pfds, input_count + 1, 50);
-        if (pr < 0) { if (errno == EINTR) continue; break; }
-
-        for (int i = 0; i < input_count; i++) {
-            if (!(pfds[i + 1].revents & POLLIN)) continue;
-            struct input_event ev;
-            ssize_t r;
-            while ((r = read(input_fds[i], &ev, sizeof(ev))) == (ssize_t)sizeof(ev)) {
-                if (ev.type != EV_KEY || ev.value != 1) continue;
-                if (ev.code == KEY_ESC) { running = 0; break; }
-                char c = key_to_ascii(ev.code);
-                if (c == '\t') { sh_complete(); }
-                else if (c == '\n') { sh_run_command(); }
-                else if (c == '\b' || ev.code == KEY_DELETE) { if (shell_len > 0) { shell_len--; shell_line[shell_len] = 0; sh_dirty = 1; } }
-                else if (c >= 0x20 && c < 0x7f) {
-                    if (shell_len < SHELL_BUF_MAX - 1) {
-                        shell_line[shell_len++] = c;
-                        shell_line[shell_len] = 0;
-                        sh_dirty = 1;
-                    }
-                }
-            }
-        }
-
-        /* drain shell output */
-        char tmp[1024];
-        int got = 0;
-        for (;;) {
-            ssize_t r = read(sh_tty_out, tmp, sizeof(tmp));
-            if (r > 0) { sh_append(tmp, (int)r); got = 1; }
-            else break;
-        }
-
-        int st = 0;
-        pid_t wpid = waitpid(sh_pid, &st, WNOHANG);
-        int alive = (wpid == 0);
-
-        /* trim trailing prompt line of sh while preserving partial line */
-        if (!got && !alive && was_alive) {
-            was_alive = 0;
-            plog("[sh] shell exited (status %d)", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
-        }
-
-        if (input_count == 0 && !alive) {
-            if (time(NULL) - idle_start > 3)
-                { sh_append("(shell exited, returning to menu)\n", 33); break; }
-        }
-        if (input_count > 0) idle_start = time(NULL);
-        if (sh_dirty) { sh_draw(); sh_dirty = 0; }
-        if (!running) break;
-        usleep(20000);
-    }
-
-    if (sh_pid > 0) { kill(sh_pid, SIGKILL); waitpid(sh_pid, NULL, 0); }
-    close(sh_tty_out); close(sh_tty_in);
-    sh_pid = -1;
-    sh_tty_out = sh_tty_in = -1;
-    /* flush pending input events left over from typing in shell */
-}
-
 /* --- Native VT shell: drop DRM master and let kernel fbcon render tty1 --- */
 #include <linux/vt.h>
 #include <linux/fb.h>
 #include <sys/kd.h>
+
 static void vt_diag(const char *tag) {
     FILE *fp = popen("cat /proc/fb 2>&1; echo ---; ls /sys/class/vtconsole 2>&1; echo ---; cat /sys/class/graphics/fb0/blank 2>&1; echo ---; cat /proc/tty/driver/vc_sel 2>/dev/null | head -5; echo ---; cat /sys/class/graphics/fb0/modes 2>&1", "r");
     if (fp) {
@@ -1169,22 +884,21 @@ static int run_cmd(const char *cmd, char *out, int outsize) {
 
 /* --- Menu screens --- */
 static const char *menu_items[] = {
-    "System Info",
     "CPU / Memory",
     "Storage",
     "Network",
     "GPU / DRM",
     "Input Devices",
     "Boot Log",
-    "Shell (embedded /bin/sh)",
+    "Shell (VT real, /bin/sh en tty1)",
     "Game Menu (RetroArch)",
     "About / Credits",
 };
 #define MENU_COUNT ((int)(sizeof(menu_items) / sizeof(menu_items[0])))
 
-#define MENU_SHELL    7
-#define MENU_RETRO    8
-#define MENU_ABOUT    9
+#define MENU_SHELL    6
+#define MENU_RETRO    7
+#define MENU_ABOUT    8
 
 static void draw_menu(void) {
     clear_screen(COLOR_BG);
@@ -1212,36 +926,6 @@ static void draw_menu(void) {
     draw_hline((fy - 1) * FONT_H, COLOR_DIM);
     draw_string(2, fy - 1, input_status, COLOR_OK, COLOR_BG);
     draw_string_center(fy, "[Up/Down] Move   [Enter] Select   [Esc] Back", COLOR_DIM, COLOR_BG);
-}
-
-static void show_system_info(void) {
-    char buf[MAX_OUTPUT];
-    clear_screen(COLOR_BG);
-    draw_string(1, 0, "== System Info ==", COLOR_TITLE, COLOR_BG);
-    draw_hline(FONT_H, COLOR_DIM);
-    run_cmd("uname -a", buf, sizeof(buf));
-    int row = 2;
-    char *p = buf;
-    while (*p && row < ROWS - 4) {
-        char line[COLS + 1];
-        int i = 0;
-        while (*p && *p != '\n' && i < COLS) line[i++] = *p++;
-        line[i] = 0;
-        if (*p == '\n') p++;
-        draw_string(1, row++, line, COLOR_FG, COLOR_BG);
-    }
-    run_cmd("cat /etc/os-release 2>/dev/null | head -5", buf, sizeof(buf));
-    row++;
-    p = buf;
-    while (*p && row < ROWS - 2) {
-        char line[COLS + 1];
-        int i = 0;
-        while (*p && *p != '\n' && i < COLS) line[i++] = *p++;
-        line[i] = 0;
-        if (*p == '\n') p++;
-        draw_string(1, row++, line, COLOR_OK, COLOR_BG);
-    }
-    draw_string_center(ROWS - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
 }
 
 static void show_cpu_mem(void) {
@@ -1451,17 +1135,133 @@ static void run_exec(char *const argv[]) {
     draw_string_center(ROWS / 2 + 1, "When it exits you return to the console", COLOR_DIM, COLOR_BG);
     drmDropMaster(drm_fd);
 
+    /* RetroArch's linuxraw input driver starts with isatty(0) and aborts with
+     * "Cannot initialize input driver" when stdin is not a terminal; the boot
+     * scripts start us without one. Give the child a console VT on stdin. The
+     * driver switches it to raw mode, so keep the old termios to put it back
+     * afterwards (a crash would otherwise leave the VT without echo). */
+    const char *tys[] = { "/dev/tty0", "/dev/console", "/dev/tty1", NULL };
+    int tty_fd = -1;
+    struct termios saved_tio;
+    int have_tio = 0;
+    for (int i = 0; tys[i]; i++) {
+        tty_fd = open(tys[i], O_RDWR | O_NOCTTY);
+        if (tty_fd >= 0) {
+            if (tcgetattr(tty_fd, &saved_tio) == 0)
+                have_tio = 1;
+            plog("[run] child stdin -> %s (tty=%d)", tys[i], isatty(tty_fd));
+            break;
+        }
+    }
+
+    /* Log with monotonic elapsed time. The device has no RTC (files land dated
+     * 1979) and RetroArch's own log carries no timestamps, so a slow start was
+     * impossible to see. The child writes into a pipe and we stamp every line
+     * with the seconds elapsed since the fork. */
+    const char *lcands[] = { "/mnt/sdcard/retroarch.log", "/sdcard/retroarch.log", NULL };
+    int log_fd = -1;
+    for (int i = 0; lcands[i]; i++) {
+        log_fd = open(lcands[i], O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (log_fd >= 0) break;
+    }
+    int pfd[2] = { -1, -1 };
+    if (pipe(pfd) != 0) { pfd[0] = pfd[1] = -1; }
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     pid_t pid = fork();
     if (pid == 0) {
         setenv("HOME", "/sdcard", 1);
+        if (tty_fd >= 0 && dup2(tty_fd, STDIN_FILENO) < 0)
+            plog("[run] dup2 stdin failed: %s", strerror(errno));
+        if (pfd[1] >= 0) {
+            close(pfd[0]);
+            dup2(pfd[1], STDOUT_FILENO);
+            dup2(pfd[1], STDERR_FILENO);
+            if (pfd[1] > STDERR_FILENO) close(pfd[1]);
+        }
         execv(argv[0], argv);
         plog("[run] exec %s failed: %s", argv[0], strerror(errno));
         _exit(127);
     }
+    if (pfd[1] >= 0) close(pfd[1]);
+
+    if (pfd[0] >= 0) {
+        int   out  = (log_fd >= 0) ? log_fd : STDERR_FILENO;
+        char  buf[2048];
+        char  out_buf[2176];
+        int   pos = 0, n;
+        for (;;) {
+            n = read(pfd[0], buf + pos, (int)sizeof(buf) - 1 - pos);
+            if (n <= 0) break;
+            pos += n;
+            int start = 0;
+            for (int i = 0; i < pos; i++) {
+                if (buf[i] != '\n') continue;
+                struct timespec t1;
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                double dt = (double)(t1.tv_sec - t0.tv_sec)
+                          + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+                int len = snprintf(out_buf, sizeof(out_buf), "[t+%.2fs] %.*s\n",
+                        dt, i - start, buf + start);
+                if (len > 0) write(out, out_buf, (size_t)len);
+                start = i + 1;
+            }
+            memmove(buf, buf + start, (size_t)(pos - start));
+            pos -= start;
+        }
+        if (pos > 0) {
+            struct timespec t1;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double dt = (double)(t1.tv_sec - t0.tv_sec)
+                      + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+            int len = snprintf(out_buf, sizeof(out_buf), "[t+%.2fs] %.*s\n",
+                    dt, pos, buf);
+            if (len > 0) write(out, out_buf, (size_t)len);
+        }
+        close(pfd[0]);
+    }
     int stt = 0;
     if (pid > 0) waitpid(pid, &stt, 0);
-    plog("[run] %s exited (status %d)",
-         argv[0], WIFEXITED(stt) ? WEXITSTATUS(stt) : -1);
+    if (have_tio)
+        tcsetattr(tty_fd, TCSANOW, &saved_tio);
+    if (tty_fd >= 0) close(tty_fd);
+    {
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double dt = (double)(t1.tv_sec - t0.tv_sec)
+                  + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        if (WIFSIGNALED(stt))
+        {
+            /* Sin esto un segfault sale como "status -1" y no se distingue de
+             * una salida normal: hay que nombrar la señal (11 = SIGSEGV). */
+            int sig = WTERMSIG(stt);
+            plog("[run] %s KILLED BY SIGNAL %d (%s)%s after %.2fs",
+                 argv[0], sig, strsignal(sig),
+                 (sig == SIGSEGV) ? " [SEGV]" : (sig == SIGABRT) ? " [ABRT]" : "",
+                 dt);
+            /* El kernel 4.4 imprime "Unhandled fault" / "segfault at ..." con la
+             * PC y el LR: es lo que dice dónde se murio. Sin esto no hay forma de
+             * saberlo, porque el equipo no tiene UART. */
+            if ((sig == SIGSEGV) || (sig == SIGABRT) || (sig == SIGILL)
+                || (sig == SIGBUS))
+            {
+                FILE *kd = popen("dmesg 2>/dev/null | tail -n 6", "r");
+                if (kd)
+                {
+                    char kb[256];
+                    while (fgets(kb, sizeof(kb), kd))
+                        plog("[run] dmesg: %s", kb);
+                    pclose(kd);
+                }
+            }
+        }
+        else
+            plog("[run] %s exited (status %d) after %.2fs",
+                 argv[0], WIFEXITED(stt) ? WEXITSTATUS(stt) : -1, dt);
+    }
+    if (log_fd >= 0) { fsync(log_fd); close(log_fd); }
 
     /* reacquire DRM master and restore our framebuffer */
     drmSetMaster(drm_fd);
@@ -1488,17 +1288,60 @@ static void run_retroarch(const char *cfg, const char *core, const char *rom) {
     else
         snprintf(cfg_path, sizeof(cfg_path), "/etc/retroarch.cfg");
 
+    /* Si existe /mnt/sdcard/retroarch-extra.cfg se pasa con --appendconfig, de
+     * forma que se pueden cambiar ajustes (audio, menu, latencia) tocando solo
+     * un fichero de la SD, sin reescribir p4 ni recompilar. Los valores de ese
+     * fichero ganan sobre /etc/retroarch.cfg. */
+    const char *extra = "/mnt/sdcard/retroarch-extra.cfg";
+    int has_extra = (access(extra, R_OK) == 0);
+    if (has_extra)
+        plog("[ra] extra config from SD: %s", extra);
+
     plog("[ra] launching RetroArch (cfg=%s core=%s rom=%s)", cfg_path, core_path, rom ? rom : "-");
-    if (core_path[0] && rom) {
-        char *argv[] = {
-            (char *)"/usr/bin/retroarch", (char *)"--config", cfg_path,
-            (char *)"-L", core_path, (char *)rom, NULL
-        };
-        run_exec(argv);
-    } else {
-        char *argv[] = {
-            (char *)"/usr/bin/retroarch", (char *)"--config", cfg_path, NULL
-        };
+
+    /* argv montado con indice explicito y en orden. Antes se armaba con
+     * ternarios dentro del array y, cuando no existia retroarch-extra.cfg, la
+     * posicion 5 caia en "-L" ademas del "-L" de la posicion 6: se pasaban
+     * "-L -L <core> <rom>". RetroArch leia el segundo "-L" como nombre de
+     * core, lo ignoraba ("--libretro argument "-L" is not a file") y moria
+     * con "Frontend is built for dynamic libretro cores, but path is not
+     * set" en 0,03 s. Con eso ningun juego arrancaba. */
+    {
+        char *argv[12];
+        int n = 0;
+        argv[n++] = (char *)"/usr/bin/retroarch";
+        argv[n++] = (char *)"--config";
+        argv[n++] = cfg_path;
+        if (has_extra)
+        {
+            argv[n++] = (char *)"--appendconfig";
+            argv[n++] = (char *)extra;
+        }
+        argv[n++] = (char *)"-v";
+        if (core_path[0] && rom && rom[0])
+        {
+            argv[n++] = (char *)"-L";
+            argv[n++] = core_path;
+            argv[n++] = (char *)rom;
+        }
+        argv[n] = NULL;
+
+        /* La linea exacta que se ejecuta: si vuelve a fallar al arrancar, el
+         * log dice sin ambiguedad que se le paso a RetroArch. */
+        {
+            char line[2048];
+            size_t used = 0;
+            int i;
+            for (i = 0; i < n; i++)
+            {
+                int w = snprintf(line + used, sizeof(line) - used, "%s%s",
+                        i ? " " : "", argv[i]);
+                if (w < 0 || (size_t)w >= sizeof(line) - used)
+                    break;
+                used += (size_t)w;
+            }
+            plog("[ra] argv: %s", line);
+        }
         run_exec(argv);
     }
 }
@@ -1779,7 +1622,6 @@ static void game_menu(void) {
 
 typedef void (*show_fn)(void);
 static show_fn show_fns[] = {
-    show_system_info,
     show_cpu_mem,
     show_storage,
     show_network,
@@ -1862,15 +1704,7 @@ int main(int argc, char *argv[]) {
         case VK_RIGHT: menu_sel = (menu_sel + 1) % MENU_COUNT; draw_menu(); break;
         case VK_ENTER:
             if (menu_sel == MENU_SHELL) {
-                /* Shell: embedded via pipes, or native VT shell if the marker
-                 * file /sdcard/vtshell exists (kernel fbcon renders /dev/tty1). */
-                int vt_mode = 0;
-                struct stat sb;
-                if (stat("/sdcard/vtshell", &sb) == 0 ||
-                    stat("/mnt/sdcard/vtshell", &sb) == 0)
-                    vt_mode = 1;
-                if (vt_mode) run_vt_shell();
-                else        run_shell();
+                run_vt_shell();
                 draw_menu();
             } else if (menu_sel == MENU_RETRO) {
                 game_menu();
@@ -1899,13 +1733,7 @@ int main(int argc, char *argv[]) {
                     draw_menu();
                     /* dispatch through the same path as VK_ENTER */
                     if (n == MENU_SHELL) {
-                        int vt_mode = 0;
-                        struct stat sb;
-                        if (stat("/sdcard/vtshell", &sb) == 0 ||
-                            stat("/mnt/sdcard/vtshell", &sb) == 0)
-                            vt_mode = 1;
-                        if (vt_mode) run_vt_shell();
-                        else        run_shell();
+                        run_vt_shell();
                         draw_menu();
                     } else if (n == MENU_RETRO) {
                         game_menu();
