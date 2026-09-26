@@ -54,7 +54,8 @@
 #define COLOR_BG        0x0000
 #define COLOR_FG        0xFFFF
 #define COLOR_HL        0xF81F  /* magenta highlight */
-#define COLOR_DIM       0x4208  /* gris oscuro */
+#define COLOR_DIM       0x4208  /* gris oscuro, solo para lineas */
+#define COLOR_FOOT       0x9516  /* gris azulado claro para pies y pistas */
 #define COLOR_TITLE     0x07FF  /* cyan */
 #define COLOR_OK        0x07E0  /* verde */
 #define COLOR_WARN      0xFFE0  /* amarillo */
@@ -87,6 +88,10 @@ static int screen_cols = 160, screen_rows = 45;
  * quepan 45 filas, las mismas que tenia el menu a 720p: a 1080p sale x3 (letra
  * de 24 px, que es lo que se lee en una TV) y a 720p x2. Asi la densidad del
  * menu no cambia con la resolucion, que es lo que fallaba antes. */
+/* Se define con el resto de lo del fondo, mas abajo; aqui solo se invalida al
+ * cambiar el modo. */
+static void bg_invalid(void);
+
 static void layout_setup(void) {
     screen_w = (int)width;
     screen_h = (int)height;
@@ -96,6 +101,9 @@ static void layout_setup(void) {
     cell_h = FONT_H * font_scale;
     screen_cols = screen_w / cell_w;
     screen_rows = screen_h / cell_h;
+    /* el canvas del fondo se compone a las medidas de arriba: si cambia el
+     * modo hay que tirarlo, si no se copian pixeles de mas */
+    bg_invalid();
     fprintf(stderr, "[drm] layout: %dx%d, font x%d -> celda %dx%d, rejilla %dx%d\n",
             screen_w, screen_h, font_scale, cell_w, cell_h, screen_cols, screen_rows);
 }
@@ -164,12 +172,48 @@ static void fill_rect(int x, int y, int w, int h, uint16_t color) {
             put_pixel(i, j, color);
 }
 
-static void draw_char(int col, int row, char ch, uint16_t fg, uint16_t bg) {
+/* Fondo de texto. BG_TRANSPARENT no pinta el glifo entero: deja el fondo de
+ * pantalla intacto, que es lo que hace falta para que la imagen se vea detras
+ * de las letras. El parametro es int y no uint16_t para que el centinela -1 no
+ * se confunda con ningun color 565 (0xFFFF es el blanco). */
+#define BG_TRANSPARENT (-1)
+#define COLOR_SHADOW  0x0000   /* negro: separa la letra de la imagen */
+
+static void draw_char(int col, int row, char ch, uint16_t fg, int bg) {
     int idx = (unsigned char)ch - 0x20;
     if (idx < 0 || idx >= 96) idx = 0;
     const unsigned char *glyph = &font_data[idx * FONT_H];
     int cx = col * cell_w;
     int cy = row * cell_h;
+    if (bg == BG_TRANSPARENT) {
+        /* Dos pasadas: primero todas las sombras y despues todas las letras.
+         * Si se hiciera en una sola pasada, la sombra de un pixel caeria encima
+         * de la letra ya pintada del pixel de la izquierda. */
+        int off = (font_scale > 1) ? font_scale / 2 : 1;
+        for (int y = 0; y < FONT_H; y++) {
+            if (!glyph[y]) continue;
+            for (int x = 0; x < FONT_W; x++) {
+                if (!(glyph[y] & (0x80 >> x))) continue;
+                if (font_scale == 1)
+                    put_pixel(cx + x + off, cy + y + off, COLOR_SHADOW);
+                else
+                    fill_rect(cx + x * font_scale + off, cy + y * font_scale + off,
+                              font_scale, font_scale, COLOR_SHADOW);
+            }
+        }
+        for (int y = 0; y < FONT_H; y++) {
+            if (!glyph[y]) continue;
+            for (int x = 0; x < FONT_W; x++) {
+                if (!(glyph[y] & (0x80 >> x))) continue;
+                if (font_scale == 1)
+                    put_pixel(cx + x, cy + y, fg);
+                else
+                    fill_rect(cx + x * font_scale, cy + y * font_scale,
+                              font_scale, font_scale, fg);
+            }
+        }
+        return;
+    }
     for (int y = 0; y < FONT_H; y++) {
         unsigned char bits = glyph[y];
         for (int x = 0; x < FONT_W; x++) {
@@ -183,13 +227,13 @@ static void draw_char(int col, int row, char ch, uint16_t fg, uint16_t bg) {
     }
 }
 
-static void draw_string(int col, int row, const char *s, uint16_t fg, uint16_t bg) {
+static void draw_string(int col, int row, const char *s, uint16_t fg, int bg) {
     while (*s && col < screen_cols) {
         draw_char(col++, row, *s++, fg, bg);
     }
 }
 
-static void draw_string_center(int row, const char *s, uint16_t fg, uint16_t bg) {
+static void draw_string_center(int row, const char *s, uint16_t fg, int bg) {
     int len = strlen(s);
     int col = (screen_cols - len) / 2;
     if (col < 0) col = 0;
@@ -272,28 +316,51 @@ static inline uint16_t rgba_to_565(const uint8_t *p) {
 }
 
 /* Draw an RGBA8 image scaled (nearest) into rect (x,y,w,h) with a bg fill. */
-/* dim = 0 la deja igual; dim = 255 la funde con el color de fondo. Se mezcla en
- * el mismo espacio 565 del framebuffer para no perder precision al convertir. */
+/* Blit escalado de un RGBA8 a un destino 565. dpitch va en BYTES y bpp es el
+ * formato del destino (16 o 32), porque el framebuffer puede ser XRGB8888 y las
+ * miniaturas tienen que salir tambien en ese caso. dst puede ser el framebuffer
+ * o un buffer fuera de pantalla (ver el canvas del fondo), que siempre es 565.
+ * Con clip=1 recorta a la pantalla. dim = 0 la deja igual y dim = 255 la funde
+ * con bg; la mezcla se hace en 565 para no perder precision al convertir. */
+static void blit_565(void *dst, int dpitch, int bpp, int clip,
+                     int x, int y, int dw, int dh,
+                     const uint8_t *px, int iw, int ih,
+                     uint16_t bg, int dim) {
+    if (!px || iw <= 0 || ih <= 0 || dw <= 0 || dh <= 0) return;
+    for (int j = 0; j < dh; j++) {
+        int py = y + j;
+        if (clip && (py < 0 || py >= screen_h)) continue;
+        int sy = (int)((int64_t)j * ih / dh);
+        if (sy >= ih) sy = ih - 1;
+        const uint8_t *src = px + (size_t)sy * iw * 4;
+        uint8_t *drow = (uint8_t *)dst + (size_t)py * dpitch;
+        for (int i = 0; i < dw; i++) {
+            int pxx = x + i;
+            if (clip && (pxx < 0 || pxx >= screen_w)) continue;
+            int sx = (int)((int64_t)i * iw / dw);
+            if (sx >= iw) sx = iw - 1;
+            const uint8_t *p = src + sx * 4;
+            uint16_t c = bg;
+            if (p[3] >= 128) {                 /* transparente = color de fondo */
+                c = rgba_to_565(p);
+                if (dim)
+                    c = (uint16_t)(c + ((int)bg - (int)c) * dim / 255);
+            }
+            if (bpp == 32)
+                ((uint32_t *)drow)[pxx] = rgb565_to_xrgb(c);
+            else
+                ((uint16_t *)drow)[pxx] = c;
+        }
+    }
+}
+
+/* dim = 0 la deja igual; dim = 255 la funde con el color de fondo. */
 static void draw_image_scaled(int x, int y, int dw, int dh,
                               const uint8_t *px, int iw, int ih,
                               uint16_t bg, int dim) {
     if (!px || iw <= 0 || ih <= 0 || dw <= 0 || dh <= 0) return;
-    fill_rect(x, y, dw, dh, bg);
-    for (int j = 0; j < dh; j++) {
-        int sy = (int)((int64_t)j * ih / dh);
-        if (sy >= ih) sy = ih - 1;
-        const uint8_t *src = px + (size_t)sy * iw * 4;
-        for (int i = 0; i < dw; i++) {
-            int sx = (int)((int64_t)i * iw / dw);
-            if (sx >= iw) sx = iw - 1;
-            const uint8_t *p = src + sx * 4;
-            if (p[3] < 128) continue;          /* skip transparent */
-            uint16_t c = rgba_to_565(p);
-            if (dim)
-                c = (uint16_t)(c + ((int)bg - (int)c) * dim / 255);
-            put_pixel(x + i, y + j, c);
-        }
-    }
+    blit_565(fb_mem, (int)fb_pitch, fb_bpp, 1,
+             x, y, dw, dh, px, iw, ih, bg, dim);
 }
 
 static void draw_hline(int y, uint16_t color) {
@@ -844,12 +911,13 @@ static const char *menu_items[] = {
 #define MENU_ABOUT    8
 
 static void draw_menu(void) {
-    clear_screen(COLOR_BG);
     draw_fondo();
-    /* title bar */
+    /* La barra de arriba si es solida, para que el titulo se lea de un vistazo.
+     * Las entradas y el pie van con fondo transparente: si no, cada letra
+     * aparece sobre su rectangulo negro y tapa la imagen. */
     fill_rect(0, 0, screen_w, cell_h + 8 * font_scale, COLOR_TITLE);
     draw_string_center(1, " GStick 4K Lite - RK3032 Test Console (v8) ", COLOR_BG, COLOR_TITLE);
-    draw_hline(cell_h + 8 * font_scale, COLOR_FG);
+    draw_hline(cell_h + 8 * font_scale, COLOR_FOOT);
 
     int start_row = 3;
     for (int i = 0; i < MENU_COUNT; i++) {
@@ -858,7 +926,7 @@ static void draw_menu(void) {
         const char *label = menu_items[i];
         int sel = (i == menu_sel);
         uint16_t fg = sel ? COLOR_BG : COLOR_FG;
-        uint16_t bg = sel ? COLOR_HL : COLOR_BG;
+        int bg = sel ? COLOR_HL : BG_TRANSPARENT;
 
         snprintf(buf, sizeof(buf), "  %c %d. %-40s",
                  sel ? '>' : ' ', i + 1, label);
@@ -867,9 +935,9 @@ static void draw_menu(void) {
 
     /* footer: input status + hints */
     int fy = screen_rows - 3;
-    draw_hline((fy - 1) * cell_h, COLOR_DIM);
-    draw_string(2, fy - 1, input_status, COLOR_OK, COLOR_BG);
-    draw_string_center(fy, "[Up/Down] Move   [Enter] Select   [Esc] Back", COLOR_DIM, COLOR_BG);
+    draw_hline((fy - 1) * cell_h, COLOR_FOOT);
+    draw_string(2, fy - 1, input_status, COLOR_OK, BG_TRANSPARENT);
+    draw_string_center(fy, "[Up/Down] Move   [Enter] Select   [Esc] Back", COLOR_FOOT, BG_TRANSPARENT);
 }
 
 static void show_cpu_mem(void) {
@@ -1419,14 +1487,53 @@ static void bg_load(void) {
     fprintf(stderr, "[drm] fondo: ninguno, menu sobre negro\n");
 }
 
-/* Atenua el fondo para que el texto se lea encima. Con 0 no se ve nada raro
- * porque el fondo del rootfs ya es oscuro; se sube si la imagen es clara. */
-#define BG_DIM 150
+/* Atenua el fondo para que el texto se lea encima. 90/255 deja un azul oscuro
+ * pero visible: con 150 el fondo salia practically negro y no se distinguia de
+ * un fondo liso. Si cambias el fondo y el texto se pierde, sube este valor. */
+#define BG_DIM 90
+
+/* El fondo se reescala una sola vez a un canvas 565 y en cada redibujado solo
+ * se copia a pantalla. Antes se reescalaba en cada pulsacion de cursor, que a
+ * 1080p son 2M de pixeles con una division por pixel, y se notaba como un
+ * parpadeo al moverse por el menu. 4 MB a 1080p,acceptable. */
+static uint16_t *bg_canvas = NULL;
+static int bg_dirty = 1;
+
+static void bg_invalid(void) {
+    bg_dirty = 1;
+    free(bg_canvas);
+    bg_canvas = NULL;
+}
+
+static void bg_prepare(void) {
+    if (!bg_dirty) return;
+    bg_dirty = 0;
+    free(bg_canvas);
+    bg_canvas = NULL;
+    if (!bg_px) return;
+    bg_canvas = malloc((size_t)screen_w * screen_h * 2);
+    if (!bg_canvas) {
+        fprintf(stderr, "[drm] fondo: sin memoria para el canvas (%dx%d)\n",
+                screen_w, screen_h);
+        return;
+    }
+    blit_565(bg_canvas, screen_w * 2, 16, 0, 0, 0, screen_w, screen_h,
+             bg_px, bg_w, bg_h, COLOR_BG, BG_DIM);
+}
 
 static void draw_fondo(void) {
     bg_load();
-    if (!bg_px) return;
-    draw_image_scaled(0, 0, screen_w, screen_h, bg_px, bg_w, bg_h, COLOR_BG, BG_DIM);
+    bg_prepare();
+    if (!bg_canvas) { clear_screen(COLOR_BG); return; }
+    for (int y = 0; y < screen_h; y++) {
+        const uint16_t *s = bg_canvas + (size_t)y * screen_w;
+        if (fb_bpp == 32) {
+            uint32_t *d = (uint32_t *)(fb_mem + (size_t)y * fb_pitch);
+            for (int x = 0; x < screen_w; x++) d[x] = rgb565_to_xrgb(s[x]);
+        } else {
+            memcpy(fb_mem + (size_t)y * fb_pitch, s, (size_t)screen_w * 2);
+        }
+    }
 }
 
 /* split command line on spaces into argv[] (up to GAME_ARGMAX tokens) */
@@ -1536,14 +1643,13 @@ static void game_menu(void) {
     int pages = (game_count + GAME_PAGE - 1) / GAME_PAGE;
     int page = 0, sel = 0;
     while (running) {
-        clear_screen(COLOR_BG);
         draw_fondo();
         fill_rect(0, 0, screen_w, cell_h + 8 * font_scale, COLOR_TITLE);
         char title[screen_cols + 1];
         snprintf(title, sizeof(title), " Game Menu - %d games (page %d/%d) ",
                  game_count, page + 1, pages);
         draw_string_center(1, title, COLOR_BG, COLOR_TITLE);
-        draw_hline(cell_h + 8 * font_scale, COLOR_FG);
+        draw_hline(cell_h + 8 * font_scale, COLOR_FOOT);
 
         int first = page * GAME_PAGE;
         int row = 3;
@@ -1555,12 +1661,12 @@ static void game_menu(void) {
                      is_sel ? '>' : ' ', game_name[idx]);
             draw_string(2, row++, padding,
                         is_sel ? COLOR_BG : COLOR_FG,
-                        is_sel ? COLOR_HL : COLOR_BG);
+                        is_sel ? COLOR_HL : BG_TRANSPARENT);
             char meta[screen_cols + 1];
             snprintf(meta, sizeof(meta), "%s %s",
                      game_cmd[idx][0] ? "CMD" : "RA ",
                      game_cmd[idx][0] ? game_cmd[idx] : game_core[idx]);
-            draw_string(3, row++, meta, COLOR_DIM, COLOR_BG);
+            draw_string(3, row++, meta, COLOR_FOOT, BG_TRANSPARENT);
         }
 
         /* thumbnail panel: generic per-system image for the selected entry */
@@ -1574,11 +1680,12 @@ static void game_menu(void) {
             char tname[screen_cols + 1];
             snprintf(tname, sizeof(tname), " %s ", game_name[sel]);
             draw_string(tx / cell_w, (ty + th) / cell_h + 1, tname,
-                        COLOR_FG, COLOR_BG);
+                        COLOR_FG, BG_TRANSPARENT);
         }
         char hint[screen_cols + 1];
-        snprintf(hint, sizeof(hint), "[Up/Down] Move  [PgUp/PgDn] Page  [Enter] Launch  [Esc] Back");
-        draw_string_center(screen_rows - 1, hint, COLOR_DIM, COLOR_BG);
+        snprintf(hint, sizeof(hint), "%s",
+                 "[Up/Down] Move  [PgUp/PgDn] Page  [Enter] Launch  [Esc] Back");
+        draw_string_center(screen_rows - 1, hint, COLOR_FOOT, BG_TRANSPARENT);
 
         int k = -1;
         while (k < 0 && running) { k = read_key(); usleep(20000); }
