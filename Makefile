@@ -54,5 +54,8 @@ clean:
 install: $(TARGET)
 	install -d $(ROOTFS)/usr/bin
 	install -m 0755 $(TARGET) $(ROOTFS)/usr/bin/$(TARGET)
+	install -d $(ROOTFS)/usr/share/drm-text-console
+	install -m 0644 share/fondo-menu-1080.png \
+	           $(ROOTFS)/usr/share/drm-text-console/fondo.png
 	@echo "Installed to $(ROOTFS)/usr/bin/$(TARGET)"
 	@echo "Remember to rebuild squashfs: mksquashfs work-rootfs-test/ new_rootfs_shell-tests.squashfs -comp gzip -noappend"
