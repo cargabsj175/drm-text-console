@@ -26,20 +26,22 @@ teclado USB vía `evdev` (`/dev/input/eventX`).
 ## Build rapido
 
 ```bash
-make          # cross-compile con toolchain Bootlin 2018.11 (../toolchain)
-make install  # copiar binario a ../work-rootfs-test/usr/bin/
+make          # cross-compile (toolchain Bootlin 2018.11 vía DTC_WORKSPACE)
+make install  # copiar binario a $DTC_WORKSPACE/work-rootfs-test/usr/bin/
 ```
 
-El Makefile usa rutas **relativas al workspace** (`../toolchain`, `../ra_source`,
-`../work-rootfs-test`). Sobreescribibles por entorno: `CROSS_COMPILE`, `SYSROOT`,
-`ROOTFS`, `LIBDRM_LIB`.
+El repo **no necesita vivir dentro del workspace**: define `DTC_WORKSPACE`
+apuntando al directorio que contiene `toolchain/`, `ra_source/` y
+`work-rootfs-test/` (está exportado en `~/.bashrc`). Si no se define, se asume el
+layout antiguo (repo un nivel por debajo del workspace). Rutas sobreescribibles
+por entorno: `CROSS_COMPILE`, `SYSROOT`, `ROOTFS`, `LIBDRM_SRC`, `LIBDRM_LIB`.
 
 ## Instalacion en el rootfs
 
 ```bash
 ./sysroot-install/install-sysroot.sh
 # reempaquetar squashfs (manual):
-mksquashfs ../work-rootfs-test ../new_rootfs_shell-tests.squashfs -comp gzip -noappend
+mksquashfs "$DTC_WORKSPACE/work-rootfs-test" "$DTC_WORKSPACE/new_rootfs_shell-tests.squashfs" -comp gzip -noappend
 ```
 
 Detalles y opciones en [sysroot-install/README.md](sysroot-install/README.md).

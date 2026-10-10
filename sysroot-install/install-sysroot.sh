@@ -4,7 +4,7 @@
 #
 # Pasos:
 #   1. Compila el binario (make) con rutas del workspace
-#   2. Instala el binario en el rootfs destino (ROOTFS, default ../work-rootfs-test)
+#   2. Instala el binario en el rootfs destino (ROOTFS, default $DTC_WORKSPACE/work-rootfs-test)
 #   3. Sustituye libdrm.so.2 del rootfs por el build propio (evita GLIBC_2.29)
 #   4. Instala el init script S99testshell (ejemplo en examples/S99testshell)
 #   5. Opcional: copia headers de libdrm al sysroot de la toolchain
@@ -13,17 +13,20 @@
 
 set -e
 
-# Workspace: hermano de este repo
-WS=$(cd "$(dirname "$0")/.." && pwd)
-ROOTFS=${ROOTFS:-"$WS/work-rootfs-test"}
-SYSROOT=${SYSROOT:-"$WS/toolchain/armv7-eabihf--glibc--stable-2018.11-1/arm-buildroot-linux-gnueabihf/sysroot"}
-LIBDRM_LIB=${LIBDRM_LIB:-"$WS/ra_source/ra/libdrm/build2018"}
-LIBDRM_SRC=${LIBDRM_SRC:-"$WS/ra_source/ra/libdrm"}
+# Workspace con toolchain/, ra_source/ y work-rootfs-test/. El repo no necesita
+# vivir dentro: define DTC_WORKSPACE (p.ej. exportalo en ~/.bashrc) o sobreescribe
+# cada ruta. Sin DTC_WORKSPACE se asume el layout antiguo (repo dentro del workspace).
+DTC_WORKSPACE=${DTC_WORKSPACE:-$(cd "$(dirname "$0")/.." && pwd)}
+ROOTFS=${ROOTFS:-"$DTC_WORKSPACE/work-rootfs-test"}
+SYSROOT=${SYSROOT:-"$DTC_WORKSPACE/toolchain/armv7-eabihf--glibc--stable-2018.11-1/arm-buildroot-linux-gnueabihf/sysroot"}
+LIBDRM_LIB=${LIBDRM_LIB:-"$DTC_WORKSPACE/ra_source/ra/libdrm/build2018"}
+LIBDRM_SRC=${LIBDRM_SRC:-"$DTC_WORKSPACE/ra_source/ra/libdrm"}
+CROSS_COMPILE=${CROSS_COMPILE:-"$DTC_WORKSPACE/toolchain/armv7-eabihf--glibc--stable-2018.11-1/bin/arm-linux-"}
 REPO=$(cd "$(dirname "$0")" && pwd)
 LIBDEST="${LIBDRM_LIB}/libdrm.so.2.134.0"
 
 echo "==> 1/4 Compilando binario"
-make -C "$REPO" CROSS_COMPILE="$WS/toolchain/armv7-eabihf--glibc--stable-2018.11-1/bin/arm-linux-"
+make -C "$REPO" DTC_WORKSPACE="$DTC_WORKSPACE" CROSS_COMPILE="$CROSS_COMPILE"
 
 echo "==> 2/4 Instalando binario en $ROOTFS/usr/bin"
 install -d "$ROOTFS/usr/bin"
@@ -57,4 +60,4 @@ fi
 
 echo "==> Listo."
 echo "Reempaquetar squashfs (manual, no se flashea nada):"
-echo "  mksquashfs $ROOTFS $WS/new_rootfs_shell-tests.squashfs -comp gzip -noappend"
+echo "  mksquashfs $ROOTFS $DTC_WORKSPACE/new_rootfs_shell-tests.squashfs -comp gzip -noappend"
