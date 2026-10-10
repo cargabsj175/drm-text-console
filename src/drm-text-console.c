@@ -1184,7 +1184,20 @@ static void run_exec(char *const argv[]) {
 
     pid_t pid = fork();
     if (pid == 0) {
-        setenv("HOME", "/sdcard", 1);
+        /* HOME apunta al punto de montaje real, no a /sdcard. El symlink
+         * /sdcard -> mnt/sdcard se restauro en el sysroot (la raiz de fabrica lo
+         * traia y el sysroot nuevo lo habia perdido), asi que ambos paths son el
+         * mismo sitio, pero usar /mnt/sdcard no depende de que ese symlink exista.
+         *
+         * Importante: con HOME=/sdcard inexistente, las apps calculan su directorio
+         * de config en $HOME/.config/... y fallan al escribir. En el caso de
+         * RetroArch eso era el fallo real de "Failed to write core info cache file":
+         * apuntaba a /sdcard/.config/retroarch/... y /sdcard no existia, no era un
+         * problema de permisos (la SD se monta rw, ver usr/lib/sdcard.sh).
+         *
+         * Mismo criterio que el log persistente mas arriba: /mnt/sdcard es el p5
+         * exFAT real y el que sobrevive a un reinicio. */
+        setenv("HOME", "/mnt/sdcard", 1);
         if (tty_fd >= 0 && dup2(tty_fd, STDIN_FILENO) < 0)
             plog("[run] dup2 stdin failed: %s", strerror(errno));
         if (pfd[1] >= 0) {
