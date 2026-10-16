@@ -9,6 +9,12 @@ Lite (Rockchip RK3032). No tests, no CI, no lint/typecheck config in the repo.
   print the max required `GLIBC_*` symbol. There is no other verification step.
 - `make install` — copy binary + `share/fondo-menu-1080.png` into `$(ROOTFS)`.
 - `make clean`.
+- Dynamic checks: the target is ARM, but this host has user-mode `qemu-arm`
+  (`/usr/bin/qemu-arm`, v11), so target binaries can be *run* for tests.
+  Statically linked ones (the rootfs/sysroot `busybox`) go directly:
+  `qemu-arm <bin>`; dynamically linked ones (dropbear, retroarch, the console)
+  need the target libs: `qemu-arm -L work-rootfs-test <bin>`. There is no ARM
+  entry in `binfmt_misc`, so nothing runs transparently — always call `qemu-arm`.
 - The build needs a workspace holding `toolchain/`, `ra_source/`,
   `work-rootfs-test/`. It no longer assumes the repo lives inside it: set
   `DTC_WORKSPACE` (currently exported in `~/.bashrc` as
@@ -61,6 +67,15 @@ Lite (Rockchip RK3032). No tests, no CI, no lint/typecheck config in the repo.
 - Background PNG lookup: `/mnt/sdcard/thumbs/fondo.png`, `/mnt/sdcard/fondo.png`,
   then `/usr/share/drm-text-console/fondo.png`.
 - The "Shell" entry drops DRM master and hands `/dev/tty1` (fbcon) to `/bin/sh`.
+
+## Workflow
+
+- **Plan before code.** Whenever we plan a change, write the analysis to a
+  `PROPOSAL-*.md` file **before** writing any code. The user reviews and refines
+  it; wait for explicit approval at the end of the analysis before implementing.
+- **Git:** never push — only the user may push. Do not commit unless explicitly
+  asked; make focused commits that match the repo's Spanish, rationale-first
+  message style.
 
 ## Style
 

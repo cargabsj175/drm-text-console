@@ -11,3 +11,5 @@ __pycache__/
 *.swp
 
 # Directorios de workspace hermano ya viven fuera del repo (../toolchain, etc.)
+
+PROPOSAL*
