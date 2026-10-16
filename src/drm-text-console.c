@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>          /* strcasecmp (game_find) */
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -36,19 +37,61 @@
 
 /* --- Configuracion --- */
 #define BUILD_VSN   9
-/* El modo ya no es fijo: se elige el mas cercano a 60 Hz, asi que el framebuffer
- * puede ser 1920x1080 y no 1280x720. screen_w/H eran el tamano fijo de la
- * rejilla y recortaban el dibujo a la esquina superior izquierda; ahora la
- * rejilla se calcula del framebuffer real (screen_w/screen_h) y el font se
- * escala para que se lea en una TV. */
+/* El modo ya no es fijo: se elige el mas cercano a target_hz, asi que el
+ * framebuffer puede ser 1920x1080 y no 1280x720. screen_w/H eran el tamano
+ * fijo de la rejilla y recortaban el dibujo a la esquina superior izquierda;
+ * ahora la rejilla se calcula del framebuffer real (screen_w/screen_h) y el
+ * font se escala para que se lea en una TV. */
 /* FONT_W y FONT_H los define fuente-intv.h (8x8) */
-#define DRM_DEV     "/dev/dri/card0"
-#define INPUT_GLOB  "/dev/input/"
 #define MAX_CMD     256
 /* Antes era screen_rows*screen_cols, que al ser ya variables no puede ser macro. 32 KB
  * cubren de sobra el peor caso: a 1920x1080 con escala 1 son 240x67 = 16080
  * caracteres. */
 #define MAX_OUTPUT  32768
+
+/* --- Config en runtime (dtc.conf) ---
+ * Los valores por defecto (los de siempre, hardcodeados) viven en cfg_defaults();
+ * dtc.conf los sobreescribe por capas: /etc/dtc.conf (imagen) y despues
+ * $XDG_CONFIG_HOME/dtc.conf o $HOME/.config/dtc.conf (usuario). Gana la ultima
+ * capa que defina la clave. Formato: "clave = valor", '#' comenta. Los alias de
+ * macros de abajo permiten que el resto del codigo siga usando los nombres de
+ * siempre (DRM_DEV, GAME_CFG, ...) sin tocar cada sitio. */
+struct dtc_cfg {
+    /* rutas */
+    char drm_dev[64];
+    char input_glob[32];
+    char game_cfg[256];
+    char thumb_dir[256];
+    char bg_path[256];        /* extra, probada antes de las 3 por defecto; "" = solo defaults */
+    char persist_log[256];    /* "" = candidatas /mnt/sdcard, /sdcard, /data */
+    char retroarch_log[256];  /* "" = candidatas /mnt/sdcard, /sdcard */
+    char retroarch_bin[128];
+    char retroarch_cfg[256];
+    char retroarch_extra[256];
+    char core_dirs[256];      /* ';' entre directorios de cores */
+    char shell[128];
+    char child_home[128];     /* HOME que heredan los hijos (retroarch, etc.) */
+    /* ajustes */
+    int  target_hz;
+    int  font_scale_div;      /* font_scale = screen_h / font_scale_div */
+    int  repeat_delay_ms;
+    int  repeat_ms;
+    int  game_page;
+    int  bg_dim;
+    int  input_rescan_s;
+    /* titulo del menu */
+    char title[128];
+};
+static struct dtc_cfg cfg;
+
+#define DRM_DEV         (cfg.drm_dev)
+#define INPUT_GLOB      (cfg.input_glob)
+#define GAME_CFG        (cfg.game_cfg)
+#define THUMB_DIR       (cfg.thumb_dir)
+#define GAME_PAGE       (cfg.game_page)
+#define REPEAT_DELAY_MS (cfg.repeat_delay_ms)
+#define REPEAT_MS       (cfg.repeat_ms)
+#define BG_DIM          (cfg.bg_dim)
 
 /* --- Colores RGB565 --- */
 #define COLOR_BG        0x0000
@@ -77,7 +120,7 @@
 
 /* --- State --- */
 static int drm_fd = -1;
-static uint32_t conn_id = 0, crtc_id = 0, fb_id = 0;
+static uint32_t conn_id = 0, crtc_id = 0;
 static uint32_t width = 1280, height = 720;
 /* Rejilla real: se deriva del framebuffer, no de constantes. */
 static int screen_w = 1280, screen_h = 720;
@@ -87,7 +130,8 @@ static int screen_cols = 160, screen_rows = 45;
 /* Calcula la rejilla a partir del modo elegido. El font se escala para que
  * quepan 45 filas, las mismas que tenia el menu a 720p: a 1080p sale x3 (letra
  * de 24 px, que es lo que se lee en una TV) y a 720p x2. Asi la densidad del
- * menu no cambia con la resolucion, que es lo que fallaba antes. */
+ * menu no cambia con la resolucion, que es lo que fallaba antes. El divisor
+ * (default 360) es la clave font_scale_div de dtc.conf. */
 /* Se define con el resto de lo del fondo, mas abajo; aqui solo se invalida al
  * cambiar el modo. */
 static void bg_invalid(void);
@@ -95,7 +139,7 @@ static void bg_invalid(void);
 static void layout_setup(void) {
     screen_w = (int)width;
     screen_h = (int)height;
-    font_scale = screen_h / 360;
+    font_scale = screen_h / cfg.font_scale_div;
     if (font_scale < 1) font_scale = 1;
     cell_w = FONT_W * font_scale;
     cell_h = FONT_H * font_scale;
@@ -114,6 +158,16 @@ static uint8_t *fb_mem = NULL;
 static uint32_t fb_pitch = 0, fb_size = 0;
 static uint32_t fb_format = DRM_FORMAT_XRGB8888;
 static int fb_bpp = 32;
+
+/* Doble buffer (page flip). fbs[0] se crea siempre; fbs[1] es el segundo y solo
+ * existe si db_enabled. fb_mem apunta SIEMPRE al back (destino de dibujo), asi
+ * que las primitivas siguen sin saber nada del doble buffer: present()
+ * intercambia front/back y re-apunta fb_mem. Si el segundo buffer no cabe
+ * (memoria), db_enabled queda a 0 y se dibuja directo sobre el visible, como
+ * antes de este cambio. */
+struct dtc_fb { uint32_t handle; uint32_t fb_id; uint8_t *mem; uint32_t pitch, size; };
+static struct dtc_fb fbs[2];
+static int fb_front = 0, fb_back = 1, db_enabled = 0;
 static volatile int running = 1;
 static int menu_sel = 0;
 
@@ -138,12 +192,155 @@ static void plog(const char *fmt, ...) {
 static void persist_open(void) {
     /* IMPORTANT: /sdcard may be tmpfs (volatile). Prefer the exFAT p5 at
      * /mnt/sdcard so the log survives a reboot and is readable on a PC. */
+    if (cfg.persist_log[0]) {
+        persist_fd = open(cfg.persist_log, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (persist_fd >= 0) { plog("persist log: %s", cfg.persist_log); return; }
+        plog("persist log: no se pudo abrir %s, candidatas por defecto", cfg.persist_log);
+    }
     const char *cands[] = { "/mnt/sdcard/dtcon.log", "/sdcard/dtcon.log",
                             "/data/dtcon.log", NULL };
     for (int i = 0; cands[i]; i++) {
         int fd = open(cands[i], O_WRONLY | O_APPEND | O_CREAT, 0644);
         if (fd >= 0) { persist_fd = fd; plog("persist log: %s", cands[i]); break; }
     }
+}
+
+/* --- dtc.conf: parser de clave=valor ---
+ * Sin secciones ni librerias: fgets, '#' corta el resto de la linea, split en
+ * el primer '='. Clave desconocida o valor fuera de rango se avisa y se
+ * ignora (no se aborta por un typo en un ajuste). */
+
+static void cfg_defaults(void) {
+    snprintf(cfg.drm_dev, sizeof(cfg.drm_dev), "/dev/dri/card0");
+    snprintf(cfg.input_glob, sizeof(cfg.input_glob), "/dev/input/");
+    snprintf(cfg.game_cfg, sizeof(cfg.game_cfg), "/mnt/sdcard/drm-text-console.cfg");
+    snprintf(cfg.thumb_dir, sizeof(cfg.thumb_dir), "/mnt/sdcard/thumbs");
+    /* bg_path/persist_log/retroarch_log/retroarch_extra vacios = comportamiento
+     * de siempre (rutas por defecto, con sus candidatas de fallback). */
+    cfg.bg_path[0] = 0;
+    cfg.persist_log[0] = 0;
+    cfg.retroarch_log[0] = 0;
+    snprintf(cfg.retroarch_bin, sizeof(cfg.retroarch_bin), "/usr/bin/retroarch");
+    snprintf(cfg.retroarch_cfg, sizeof(cfg.retroarch_cfg), "/etc/retroarch.cfg");
+    snprintf(cfg.retroarch_extra, sizeof(cfg.retroarch_extra), "/mnt/sdcard/retroarch-extra.cfg");
+    snprintf(cfg.core_dirs, sizeof(cfg.core_dirs), "/sdcard/retro_lib;/mnt/sdcard/retro_lib");
+    snprintf(cfg.shell, sizeof(cfg.shell), "/bin/sh");
+    snprintf(cfg.child_home, sizeof(cfg.child_home), "/mnt/sdcard");
+    cfg.target_hz = 60;
+    cfg.font_scale_div = 360;
+    cfg.repeat_delay_ms = 400;
+    cfg.repeat_ms = 120;
+    cfg.game_page = 8;
+    cfg.bg_dim = 90;
+    cfg.input_rescan_s = 2;
+    /* El titulo por defecto lleva la version del binario: con un literal a mano
+     * se desincronizo (decia v8 con BUILD_VSN 9). */
+    snprintf(cfg.title, sizeof(cfg.title),
+             " GStick 4K Lite - RK3032 Test Console (v%d) ", BUILD_VSN);
+}
+
+/* Aplica key=val. Devuelve 0 si la clave se conoce, -1 si es desconocida. */
+static int cfg_set(const char *key, const char *val) {
+    struct { const char *k; char *dst; size_t cap; int allow_empty; } strs[] = {
+        { "drm_dev",         cfg.drm_dev,         sizeof(cfg.drm_dev),         0 },
+        { "input_glob",      cfg.input_glob,      sizeof(cfg.input_glob),      0 },
+        { "game_cfg",        cfg.game_cfg,        sizeof(cfg.game_cfg),        0 },
+        { "thumb_dir",       cfg.thumb_dir,       sizeof(cfg.thumb_dir),       0 },
+        { "bg_path",         cfg.bg_path,         sizeof(cfg.bg_path),         1 },
+        { "persist_log",     cfg.persist_log,     sizeof(cfg.persist_log),     1 },
+        { "retroarch_log",   cfg.retroarch_log,   sizeof(cfg.retroarch_log),   1 },
+        { "retroarch_bin",   cfg.retroarch_bin,   sizeof(cfg.retroarch_bin),   0 },
+        { "retroarch_cfg",   cfg.retroarch_cfg,   sizeof(cfg.retroarch_cfg),   0 },
+        { "retroarch_extra", cfg.retroarch_extra, sizeof(cfg.retroarch_extra), 1 },
+        { "core_dirs",       cfg.core_dirs,       sizeof(cfg.core_dirs),       0 },
+        { "shell",           cfg.shell,           sizeof(cfg.shell),           0 },
+        { "child_home",      cfg.child_home,      sizeof(cfg.child_home),      0 },
+        { "title",           cfg.title,           sizeof(cfg.title),           0 },
+    };
+    for (size_t i = 0; i < sizeof(strs) / sizeof(strs[0]); i++) {
+        if (strcmp(key, strs[i].k)) continue;
+        if (!val[0] && !strs[i].allow_empty) {
+            plog("[cfg] clave '%s' no admite valor vacio, se ignora", key);
+            return 0;
+        }
+        snprintf(strs[i].dst, strs[i].cap, "%s", val);
+        return 0;
+    }
+    struct { const char *k; int *dst; int lo, hi; } nums[] = {
+        { "target_hz",       &cfg.target_hz,       24,  240  },
+        { "font_scale_div",  &cfg.font_scale_div,  60,  1080 },
+        { "repeat_delay_ms", &cfg.repeat_delay_ms, 50,  5000 },
+        { "repeat_ms",       &cfg.repeat_ms,       20,  2000 },
+        { "game_page",       &cfg.game_page,       1,   16   },
+        { "bg_dim",          &cfg.bg_dim,          0,   255  },
+        { "input_rescan_s",  &cfg.input_rescan_s,  1,   60   },
+    };
+    for (size_t i = 0; i < sizeof(nums) / sizeof(nums[0]); i++) {
+        if (strcmp(key, nums[i].k)) continue;
+        int v = atoi(val);
+        if (v < nums[i].lo || v > nums[i].hi) {
+            plog("[cfg] valor fuera de rango para %s: '%s' (esperado %d..%d), se ignora",
+                 key, val, nums[i].lo, nums[i].hi);
+            return 0;
+        }
+        *nums[i].dst = v;
+        return 0;
+    }
+    return -1;
+}
+
+static void cfg_load_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;   /* ausente es lo normal: no es un error */
+    plog("[cfg] cargando %s", path);
+    char line[512];
+    int nline = 0;
+    while (fgets(line, sizeof(line), f)) {
+        nline++;
+        char *hash = strchr(line, '#');
+        if (hash) *hash = 0;
+        char *eq = strchr(line, '=');
+        if (!eq) {
+            /* sin '=': o es una linea en blanco o es una entrada mal formada */
+            char *p = line;
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+            if (*p) plog("[cfg] %s:%d sin '=': %s", path, nline, p);
+            continue;
+        }
+        *eq = 0;
+        char *key = line, *val = eq + 1;
+        while (*key == ' ' || *key == '\t') key++;
+        char *t = key + strlen(key);
+        while (t > key && (t[-1] == ' ' || t[-1] == '\t' || t[-1] == '\r' || t[-1] == '\n')) *--t = 0;
+        while (*val == ' ' || *val == '\t') val++;
+        t = val + strlen(val);
+        while (t > val && (t[-1] == ' ' || t[-1] == '\t' || t[-1] == '\r' || t[-1] == '\n')) *--t = 0;
+        if (!*key) continue;
+        if (cfg_set(key, val) < 0)
+            plog("[cfg] %s:%d clave desconocida: %s", path, nline, key);
+    }
+    fclose(f);
+}
+
+static void cfg_load(void) {
+    cfg_defaults();
+    cfg_load_file("/etc/dtc.conf");
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    const char *home = getenv("HOME");
+    if (xdg && xdg[0]) {
+        char p[320];
+        snprintf(p, sizeof(p), "%s/dtc.conf", xdg);
+        cfg_load_file(p);
+    } else if (home && home[0]) {
+        char p[320];
+        snprintf(p, sizeof(p), "%s/.config/dtc.conf", home);
+        cfg_load_file(p);
+    } else {
+        plog("[cfg] sin HOME ni XDG_CONFIG_HOME: capa de usuario omitida");
+    }
+    plog("[cfg] drm_dev=%s target_hz=%d game_page=%d bg_dim=%d",
+         cfg.drm_dev, cfg.target_hz, cfg.game_page, cfg.bg_dim);
+    plog("[cfg] game_cfg=%s title='%s'", cfg.game_cfg, cfg.title);
 }
 
 /* --- Pixel conversion (RGB565 -> format) --- */
@@ -377,7 +574,8 @@ static int find_connector(void) {
         if (!conn) continue;
         if (conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0) {
             conn_id = conn->connector_id;
-            /* neonatox: se elige el modo mas cercano a 60 Hz en vez de modes[0].
+            /* neonatox: se elige el modo mas cercano a cfg.target_hz (60) en vez
+             * de modes[0].
              * Motivo medido: el ritmo lo marca la pantalla, no el driver. Con el
              * modo que daba modes[0] (1280x720 @ 50 Hz) un core de 60 fps iba a
              * 50 fps, o sea al 83% de velocidad, con el driver perfecto
@@ -389,8 +587,8 @@ static int find_connector(void) {
             {
                 int best = 0;
                 for (int m = 0; m < conn->count_modes; m++) {
-                    int d_new = abs(conn->modes[m].vrefresh - 60);
-                    int d_old = abs(conn->modes[best].vrefresh - 60);
+                    int d_new = abs(conn->modes[m].vrefresh - cfg.target_hz);
+                    int d_old = abs(conn->modes[best].vrefresh - cfg.target_hz);
                     if (d_new < d_old ||
                         (d_new == d_old &&
                          conn->modes[m].hdisplay * conn->modes[m].vdisplay >
@@ -436,6 +634,59 @@ static int find_connector(void) {
     return -1;
 }
 
+/* Crea un dumb buffer, lo mapea y le asocia un framebuffer en out. use_addfb2
+ * elige AddFB2 (fmt fourcc) o el AddFB legacy (depth/bpp). Reune en un solo
+ * sitio el manejo de errores, que en la version de un solo buffer estaba
+ * duplicado tres veces y era facil de dejar inconsistente. */
+static int alloc_fb_common(uint32_t fmt, int bpp, int depth, int use_addfb2,
+                           struct dtc_fb *out) {
+    struct drm_mode_create_dumb creq = {0};
+    creq.width = width;
+    creq.height = height;
+    creq.bpp = bpp;
+    if (ioctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) {
+        fprintf(stderr, "[drm] CREATE_DUMB (bpp=%d) failed: %s\n", bpp, strerror(errno));
+        return -1;
+    }
+    struct drm_mode_map_dumb mreq = {0};
+    mreq.handle = creq.handle;
+    if (ioctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0) {
+        fprintf(stderr, "[drm] MAP_DUMB (bpp=%d) failed: %s\n", bpp, strerror(errno));
+        ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &creq);
+        return -1;
+    }
+    uint8_t *mem = mmap(0, creq.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        drm_fd, mreq.offset);
+    if (mem == MAP_FAILED) {
+        fprintf(stderr, "[drm] mmap (bpp=%d) failed: %s\n", bpp, strerror(errno));
+        ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &creq);
+        return -1;
+    }
+    uint32_t id = 0;
+    int r;
+    if (use_addfb2) {
+        uint32_t handles[4] = { creq.handle, 0, 0, 0 };
+        uint32_t pitches[4] = { creq.pitch, 0, 0, 0 };
+        uint32_t offsets[4] = { 0, 0, 0, 0 };
+        r = drmModeAddFB2(drm_fd, width, height, fmt, handles, pitches, offsets, &id, 0);
+    } else {
+        r = drmModeAddFB(drm_fd, width, height, depth, bpp, creq.pitch, creq.handle, &id);
+    }
+    if (r != 0) {
+        fprintf(stderr, "[drm] AddFB%s (bpp=%d) failed: %s\n",
+                use_addfb2 ? "2" : "", bpp, strerror(errno));
+        munmap(mem, creq.size);
+        ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &creq);
+        return -1;
+    }
+    out->handle = creq.handle;
+    out->fb_id = id;
+    out->mem = mem;
+    out->pitch = creq.pitch;
+    out->size = creq.size;
+    return 0;
+}
+
 static int create_framebuffer(void) {
     /* Diagnostic: dump the formats the driver advertises per plane */
     drmModePlaneResPtr pres = drmModeGetPlaneResources(drm_fd);
@@ -453,131 +704,75 @@ static int create_framebuffer(void) {
         drmModeFreePlaneResources(pres);
     }
 
-    /* Try several format/bpp combos via dumb buffers + AddFB2 */
+    /* El formato ganador se guarda para crear el segundo buffer identico. */
+    uint32_t fmt = 0;
+    int bpp = 0, depth = 24, use_addfb2 = 1;
+
+    /* Fase 1: AddFB2 con los formatos habituales, en el mismo orden de antes. */
     struct { uint32_t fmt; int bpp; const char *name; } tries[] = {
         { DRM_FORMAT_XRGB8888, 32, "XRGB8888" },
         { DRM_FORMAT_RGB565,   16, "RGB565"   },
         { DRM_FORMAT_ARGB8888, 32, "ARGB8888" },
         { DRM_FORMAT_RGB888,   24, "RGB888"   },
     };
-
-    struct drm_mode_create_dumb creq = {0};
-    struct drm_mode_map_dumb mreq = {0};
-    int ok = -1;
-
     for (size_t t = 0; t < sizeof(tries)/sizeof(tries[0]); t++) {
-        creq = (struct drm_mode_create_dumb){0};
-        creq.width = width;
-        creq.height = height;
-        creq.bpp = tries[t].bpp;
-        if (ioctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) {
-            fprintf(stderr, "[drm] CREATE_DUMB %s failed: %s\n",
-                    tries[t].name, strerror(errno));
-            continue;
-        }
-        mreq = (struct drm_mode_map_dumb){0};
-        mreq.handle = creq.handle;
-        if (ioctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0) {
-            fprintf(stderr, "[drm] MAP_DUMB %s failed: %s\n",
-                    tries[t].name, strerror(errno));
-            ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &creq);
-            continue;
-        }
-        fb_mem = mmap(0, creq.size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                      drm_fd, mreq.offset);
-        if (fb_mem == MAP_FAILED) {
-            fprintf(stderr, "[drm] mmap %s failed: %s\n",
-                    tries[t].name, strerror(errno));
-            ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &creq);
-            fb_mem = NULL;
-            continue;
-        }
-
-        uint32_t handles[4] = { creq.handle, 0, 0, 0 };
-        uint32_t pitches[4] = { creq.pitch, 0, 0, 0 };
-        uint32_t offsets[4] = { 0, 0, 0, 0 };
-        if (drmModeAddFB2(drm_fd, width, height, tries[t].fmt,
-                          handles, pitches, offsets, &fb_id, 0) == 0) {
-            ok = 0;
-            fb_pitch = creq.pitch;
-            fb_size = creq.size;
-            fb_format = tries[t].fmt;
-            fb_bpp = tries[t].bpp;
+        if (alloc_fb_common(tries[t].fmt, tries[t].bpp, 24, 1, &fbs[0]) == 0) {
+            fmt = tries[t].fmt;
+            bpp = tries[t].bpp;
+            depth = 24;
+            use_addfb2 = 1;
             fprintf(stderr, "[drm] AddFB2 OK with %s (%dx%d, pitch=%u, size=%u)\n",
-                    tries[t].name, width, height, fb_pitch, fb_size);
+                    tries[t].name, width, height, fbs[0].pitch, fbs[0].size);
             break;
         }
-        fprintf(stderr, "[drm] AddFB2 %s failed: %s\n",
-                tries[t].name, strerror(errno));
-        munmap(fb_mem, creq.size);
-        fb_mem = NULL;
-        ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &creq);
     }
 
-    /* Fallback: legacy drmModeAddFB (depth/bpp) if AddFB2 was rejected */
-    if (ok < 0) {
-        struct { int depth; int bpp; const char *name; } lg[] = {
-            { 24, 32, "legacy 24/32" },
-            { 16, 16, "legacy 16/16" },
+    /* Fase 2: legacy drmModeAddFB (depth/bpp) si AddFB2 fue rechazado para todo. */
+    if (!bpp) {
+        struct { int depth; int bpp; uint32_t fmt; const char *name; } lg[] = {
+            { 24, 32, DRM_FORMAT_XRGB8888, "legacy 24/32" },
+            { 16, 16, DRM_FORMAT_RGB565,   "legacy 16/16" },
         };
         for (size_t t = 0; t < sizeof(lg)/sizeof(lg[0]); t++) {
-            creq = (struct drm_mode_create_dumb){0};
-            creq.width = width;
-            creq.height = height;
-            creq.bpp = lg[t].bpp;
-            if (ioctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) {
-                fprintf(stderr, "[drm] CREATE_DUMB %s failed: %s\n",
-                        lg[t].name, strerror(errno));
-                continue;
-            }
-            if (drmModeAddFB(drm_fd, width, height, lg[t].depth, lg[t].bpp,
-                             creq.pitch, creq.handle, &fb_id) == 0) {
-                ok = 0;
-                fb_pitch = creq.pitch;
-                fb_size = creq.size;
-                fb_format = (lg[t].bpp == 16) ? DRM_FORMAT_RGB565
-                                              : DRM_FORMAT_XRGB8888;
-                fb_bpp = lg[t].bpp;
+            if (alloc_fb_common(lg[t].fmt, lg[t].bpp, lg[t].depth, 0, &fbs[0]) == 0) {
+                fmt = lg[t].fmt;
+                bpp = lg[t].bpp;
+                depth = lg[t].depth;
+                use_addfb2 = 0;
                 fprintf(stderr, "[drm] legacy AddFB OK %s (pitch=%u, size=%u)\n",
-                        lg[t].name, fb_pitch, fb_size);
-                mreq = (struct drm_mode_map_dumb){0};
-                mreq.handle = creq.handle;
-                if (ioctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0) {
-                    fprintf(stderr, "[drm] MAP_DUMB %s failed: %s\n",
-                            lg[t].name, strerror(errno));
-                    ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &creq);
-                    fb_id = 0;
-                    ok = -1;
-                    continue;
-                }
-                fb_mem = mmap(0, fb_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                              drm_fd, mreq.offset);
-                if (fb_mem == MAP_FAILED) {
-                    fprintf(stderr, "[drm] mmap %s failed: %s\n",
-                            lg[t].name, strerror(errno));
-                    ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &creq);
-                    fb_id = 0;
-                    fb_mem = NULL;
-                    ok = -1;
-                    continue;
-                }
+                        lg[t].name, fbs[0].pitch, fbs[0].size);
                 break;
             }
-            fprintf(stderr, "[drm] legacy AddFB %s failed: %s\n",
-                    lg[t].name, strerror(errno));
-            ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &creq);
         }
     }
 
-    if (ok < 0) {
+    if (!bpp) {
         fprintf(stderr, "[drm] No usable framebuffer format\n");
         return -1;
     }
 
-    memset(fb_mem, 0, fb_size);
+    fb_format = fmt;
+    fb_bpp = bpp;
+    fb_pitch = fbs[0].pitch;
+    fb_size = fbs[0].size;
+    memset(fbs[0].mem, 0, fb_size);
+
+    /* Segundo buffer con el mismo formato y la misma ruta que el primero: si no
+     * cabe (memoria), se sigue con uno solo y solo se pierde el suavizado. */
+    if (alloc_fb_common(fmt, bpp, depth, use_addfb2, &fbs[1]) == 0) {
+        memset(fbs[1].mem, 0, fb_size);
+        db_enabled = 1;
+        fprintf(stderr, "[drm] doble buffer activo (2 x %u bytes)\n", fb_size);
+    } else {
+        db_enabled = 0;
+        fprintf(stderr, "[drm] sin doble buffer: segundo buffer no disponible\n");
+    }
+    fb_front = 0;
+    fb_back = db_enabled ? 1 : 0;
+    fb_mem = fbs[fb_back].mem;
 
     /* Set CRTC */
-    if (drmModeSetCrtc(drm_fd, crtc_id, fb_id, 0, 0, &conn_id, 1, &drm_mode)) {
+    if (drmModeSetCrtc(drm_fd, crtc_id, fbs[0].fb_id, 0, 0, &conn_id, 1, &drm_mode)) {
         fprintf(stderr, "drmModeSetCrtc failed: %s\n", strerror(errno));
         return -1;
     }
@@ -586,9 +781,57 @@ static int create_framebuffer(void) {
     return 0;
 }
 
+/* Un flip concreto avisa de que termino; solo hace falta el flag, no el dato. */
+static volatile int flip_done = 0;
+static void on_page_flip(int fd, unsigned int frame, unsigned int sec,
+                         unsigned int usec, void *data) {
+    (void)fd; (void)frame; (void)sec; (void)usec; (void)data;
+    flip_done = 1;
+}
+
+/* Muestra el frame recien dibujado (el back) e intercambia front/back. Con
+ * db_enabled=0 no hay nada que hacer: se dibujo directo sobre el visible. Se
+ * prefiere page flip (asincrono, sin modeset); si el driver no lo soporta o no
+ * llega el evento, SetCrtc hace el mismo cambio de forma sincrona, que ya basta
+ * para quitar el tearing aunque no sea asincrono. La espera es imprescindible:
+ * hasta que el flip no termina, el buffer viejo sigue en scanout y no se puede
+ * dibujar sobre el (el poll del drm_fd es independiente del de input). */
+static void present(void) {
+    if (!db_enabled) return;
+    int nb = fb_back;
+    int flipped = 0;
+    if (drmModePageFlip(drm_fd, crtc_id, fbs[nb].fb_id,
+                        DRM_MODE_PAGE_FLIP_EVENT, NULL) == 0) {
+        struct pollfd p = { drm_fd, POLLIN, 0 };
+        if (poll(&p, 1, 100) > 0) {
+            flip_done = 0;
+            drmEventContext evctx;
+            memset(&evctx, 0, sizeof(evctx));
+            evctx.version = DRM_EVENT_CONTEXT_VERSION;
+            evctx.page_flip_handler = on_page_flip;
+            drmHandleEvent(drm_fd, &evctx);
+            flipped = flip_done;
+        }
+    }
+    if (!flipped)
+        drmModeSetCrtc(drm_fd, crtc_id, fbs[nb].fb_id, 0, 0, &conn_id, 1, &drm_mode);
+    fb_front = nb;
+    fb_back = 1 - nb;
+    fb_mem = fbs[fb_back].mem;
+}
+
 static void cleanup_drm(void) {
-    if (fb_mem) { munmap(fb_mem, fb_size); fb_mem = NULL; }
-    if (fb_id) { drmModeRmFB(drm_fd, fb_id); fb_id = 0; }
+    for (int i = 0; i < 2; i++) {
+        if (fbs[i].mem) { munmap(fbs[i].mem, fbs[i].size); fbs[i].mem = NULL; }
+        if (fbs[i].fb_id) { drmModeRmFB(drm_fd, fbs[i].fb_id); fbs[i].fb_id = 0; }
+        if (fbs[i].handle) {
+            struct drm_mode_destroy_dumb dreq = {0};
+            dreq.handle = fbs[i].handle;
+            ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+            fbs[i].handle = 0;
+        }
+    }
+    fb_mem = NULL;
     if (drm_fd >= 0) close(drm_fd);
 }
 
@@ -597,6 +840,7 @@ static void cleanup_drm(void) {
 #define MX_INPUT 8
 static int input_fds[MX_INPUT];
 static int input_absaxis[MX_INPUT];  /* 1 if we may use ABS_X/ABS_Y (gamepad) */
+static int input_deadzone[MX_INPUT]; /* umbral del eje analogico, 0 si no aplica */
 static int input_count = 0;
 static char input_names[MX_INPUT][48];
 static int last_ev_type = -1, last_ev_code = -1, last_ev_val = 0;
@@ -609,9 +853,15 @@ static char input_status[96] = "waiting...";
 #define VK_RIGHT  0x104
 #define VK_ENTER  0x105
 #define VK_ESC    0x106
+#define VK_PGUP   0x107
+#define VK_PGDN   0x108
 #define VK_NUM(_n) (0x200 + (_n))  /* VK_NUM(1)..VK_NUM(10) */
 
-static int map_key(const struct input_event *ev, int from_absaxis) {
+/* Mapea un evento al codigo interno. Recibe el indice del dispositivo para
+ * poder usar su deadzone (el rango de un stick varia por mando) y para saber si
+ * sus ejes son utilizables. Se usan BTN_TL/BTN_TR (nombres clasicos) y no
+ * BTN_L1/BTN_R1, que pueden no existir en las cabeceras de 2018.11. */
+static int map_key(const struct input_event *ev, int dev) {
     if (ev->type == EV_KEY && ev->value == 1) {
         switch (ev->code) {
         case KEY_UP: case BTN_DPAD_UP: case BTN_TOP: case BTN_TOP2:
@@ -623,11 +873,15 @@ static int map_key(const struct input_event *ev, int from_absaxis) {
         case KEY_RIGHT: case BTN_DPAD_RIGHT: case BTN_THUMBR:
             return VK_RIGHT;
         case KEY_ENTER: case KEY_KPENTER:
-        case BTN_A: case BTN_START: case BTN_MODE:
+        case BTN_A: case BTN_START: case BTN_MODE: case BTN_X:
             return VK_ENTER;
         case KEY_ESC: case KEY_BACKSPACE:
-        case BTN_B: case BTN_SELECT:
+        case BTN_B: case BTN_SELECT: case BTN_Y:
             return VK_ESC;
+        case KEY_PAGEUP: case BTN_TL: case BTN_TL2:
+            return VK_PGUP;
+        case KEY_PAGEDOWN: case BTN_TR: case BTN_TR2:
+            return VK_PGDN;
         default:
             if (ev->code >= KEY_1 && ev->code <= KEY_9)
                 return VK_NUM(ev->code - KEY_1 + 1);
@@ -640,12 +894,13 @@ static int map_key(const struct input_event *ev, int from_absaxis) {
             return -1;
         }
     }
-    if (ev->type == EV_ABS && ev->value != 0 && from_absaxis) {
+    if (ev->type == EV_ABS && ev->value != 0 && input_absaxis[dev]) {
+        int dz = input_deadzone[dev] > 0 ? input_deadzone[dev] : 200;
         switch (ev->code) {
         case ABS_HAT0X: return (ev->value < 0) ? VK_LEFT : VK_RIGHT;
         case ABS_HAT0Y: return (ev->value < 0) ? VK_UP : VK_DOWN;
-        case ABS_X: return (ev->value >  200) ? VK_RIGHT : (ev->value < -200 ? VK_LEFT : -1);
-        case ABS_Y: return (ev->value >  200) ? VK_DOWN  : (ev->value < -200 ? VK_UP : -1);
+        case ABS_X: return (ev->value >  dz) ? VK_RIGHT : (ev->value < -dz ? VK_LEFT : -1);
+        case ABS_Y: return (ev->value >  dz) ? VK_DOWN  : (ev->value < -dz ? VK_UP : -1);
         default: return -1;
         }
     }
@@ -699,6 +954,9 @@ static void run_vt_shell(void) {
     clear_screen(COLOR_BG);
     draw_string_center(screen_rows / 2 - 1, "Switching to native VT console (fbcon)...",
                        COLOR_WARN, COLOR_BG);
+    draw_string_center(screen_rows / 2 + 1, "Type 'exit' in the shell to return",
+                       COLOR_DIM, COLOR_BG);
+    present();
     vt_diag("before");
 
     drmDropMaster(drm_fd);
@@ -738,7 +996,7 @@ static void run_vt_shell(void) {
         dup2(ttyfd, 1);
         dup2(ttyfd, 2);
         if (ttyfd > 2) close(ttyfd);
-        execl("/bin/sh", "/bin/sh", NULL);
+        execl(cfg.shell, cfg.shell, NULL);
         _exit(127);
     }
     close(ttyfd);
@@ -763,7 +1021,7 @@ static void run_vt_shell(void) {
 
     /* reacquire DRM + redraw menu */
     drmSetMaster(drm_fd);
-    drmModeSetCrtc(drm_fd, crtc_id, fb_id, 0, 0, &conn_id, 1, &drm_mode);
+    drmModeSetCrtc(drm_fd, crtc_id, fbs[fb_front].fb_id, 0, 0, &conn_id, 1, &drm_mode);
 }
 
 static void diag_usb(void) {
@@ -830,8 +1088,26 @@ static int open_input(void) {
                 for (int i = 0; i < (int)(sizeof(abits)*8); i++)
                     if (abits[i >> 6] & (1UL << (i & 63))) has_rel = 1;
             input_absaxis[input_count] = (has_abs && !has_rel) ? 1 : 0;
-            plog("[input] OPEN %s (axes: %s)", path,
-                 input_absaxis[input_count] ? "yes" : "no");
+            /* Deadzone por dispositivo: el rango de un stick no es siempre
+             * -32768..32767 (hay mandos con -128..127), asi que un umbral fijo
+             * era o demasiado sensible o inservible. Se usa el rango real del
+             * eje; si el driver declara un "flat", ese manda. */
+            input_deadzone[input_count] = 0;
+            if (input_absaxis[input_count]) {
+                struct input_absinfo ai;
+                long dz = 0;
+                if (ioctl(fd, EVIOCGABS(ABS_X), &ai) == 0) {
+                    int64_t lo = ai.minimum < 0 ? -(int64_t)ai.minimum : (int64_t)ai.minimum;
+                    int64_t hi = ai.maximum < 0 ? -(int64_t)ai.maximum : (int64_t)ai.maximum;
+                    int64_t rng = lo > hi ? lo : hi;
+                    dz = ai.flat > 0 ? (long)ai.flat : (long)(rng / 3);
+                }
+                if (dz < 1) dz = 1;
+                input_deadzone[input_count] = (int)dz;
+            }
+            plog("[input] OPEN %s (axes: %s, deadzone: %d)", path,
+                 input_absaxis[input_count] ? "yes" : "no",
+                 input_deadzone[input_count]);
             input_count++;
         } else {
             plog("[input] SKIP %s (no keys/axes)", path);
@@ -842,6 +1118,24 @@ static int open_input(void) {
     return (input_count > 0) ? 0 : -1;
 }
 
+/* Autorepeat: el kernel no repite EV_ABS ni los botones de un mando, asi que
+ * mantener el stick o el D-pad solo movia un paso. Se recuerda la direccion
+ * pulsada y el propio poll (timeout 50 ms) la reemite. El release (EV_KEY con
+ * value 0) o el neutro del eje la sueltan; los EV_KEY con value 2 del
+ * autorepeat del kernel se ignoran sin tocar el estado. Los tiempos salen de
+ * dtc.conf (repeat_delay_ms / repeat_ms). */
+static int  held_dir = -1;            /* VK_* de la direccion mantenida */
+static long held_code = -1;           /* codigo EV_KEY que la mantiene, -1 si es eje */
+static int64_t held_next_ms = 0;
+
+/* long es de 32 bits en ARM: con ms desde CLOCK_MONOTONIC desbordaria a los ~24
+ * dias de uptime, y este equipo se queda encendido. Por eso int64_t. */
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static int read_key(void) {
     if (input_count == 0) return -1;
     struct pollfd pfds[MX_INPUT];
@@ -849,7 +1143,15 @@ static int read_key(void) {
         pfds[i].fd = input_fds[i];
         pfds[i].events = POLLIN;
     }
-    if (poll(pfds, input_count, 50) <= 0) return -1;
+    int pr = poll(pfds, input_count, 50);
+    if (pr < 0) return -1;
+    if (pr == 0) {
+        if (held_dir > 0 && now_ms() >= held_next_ms) {
+            held_next_ms = now_ms() + REPEAT_MS;
+            return held_dir;
+        }
+        return -1;
+    }
     for (int i = 0; i < input_count; i++) {
         if (!(pfds[i].revents & POLLIN)) continue;
         struct input_event ev;
@@ -858,19 +1160,36 @@ static int read_key(void) {
             /* raw logging of every key/abs event so we can map exact codes */
             if (ev.type == EV_KEY && ev.value == 1)
                 plog("[input] dev%d KEY code=%d -> VK 0x%x",
-                     i, ev.code, map_key(&ev, input_absaxis[i]));
+                     i, ev.code, map_key(&ev, i));
             /* live status for on-screen diagnostics */
             last_ev_type = ev.type;
             last_ev_code = ev.code;
             last_ev_val = ev.value;
-            int vk = map_key(&ev, input_absaxis[i]);
+            int vk = map_key(&ev, i);
             if (vk > 0) {
+                if (vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT) {
+                    held_dir = vk;
+                    held_code = (ev.type == EV_KEY) ? ev.code : -1;
+                    held_next_ms = now_ms() + REPEAT_DELAY_MS;
+                }
                 snprintf(input_status, sizeof(input_status),
                          "dev%d T=%d C=%d V=%d -> VK 0x%x",
                          i, ev.type, ev.code, ev.value, vk);
                 plog("[input] dev%d event type=%d code=%d value=%d -> VK 0x%x",
                      i, ev.type, ev.code, ev.value, vk);
                 return vk;
+            }
+            /* release o neutro: suelta la direccion mantenida */
+            if (held_dir > 0) {
+                int dz = input_deadzone[i] > 0 ? input_deadzone[i] : 200;
+                if (ev.type == EV_KEY && ev.value == 0 && ev.code == held_code)
+                    held_dir = -1;
+                else if (ev.type == EV_ABS &&
+                         (ev.code == ABS_HAT0X || ev.code == ABS_HAT0Y) && ev.value == 0)
+                    held_dir = -1;
+                else if (ev.type == EV_ABS &&
+                         (ev.code == ABS_X || ev.code == ABS_Y) && abs(ev.value) <= dz)
+                    held_dir = -1;
             }
         }
     }
@@ -916,7 +1235,7 @@ static void draw_menu(void) {
      * Las entradas y el pie van con fondo transparente: si no, cada letra
      * aparece sobre su rectangulo negro y tapa la imagen. */
     fill_rect(0, 0, screen_w, cell_h + 8 * font_scale, COLOR_TITLE);
-    draw_string_center(1, " GStick 4K Lite - RK3032 Test Console (v8) ", COLOR_BG, COLOR_TITLE);
+    draw_string_center(1, cfg.title, COLOR_BG, COLOR_TITLE);
     draw_hline(cell_h + 8 * font_scale, COLOR_FOOT);
 
     int start_row = 3;
@@ -938,6 +1257,7 @@ static void draw_menu(void) {
     draw_hline((fy - 1) * cell_h, COLOR_FOOT);
     draw_string(2, fy - 1, input_status, COLOR_OK, BG_TRANSPARENT);
     draw_string_center(fy, "[Up/Down] Move   [Enter] Select   [Esc] Back", COLOR_FOOT, BG_TRANSPARENT);
+    present();
 }
 
 static void show_cpu_mem(void) {
@@ -969,6 +1289,7 @@ static void show_cpu_mem(void) {
         draw_string(1, row++, line, COLOR_FG, COLOR_BG);
     }
     draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    present();
 }
 
 static void show_storage(void) {
@@ -988,6 +1309,7 @@ static void show_storage(void) {
         draw_string(1, row++, line, COLOR_FG, COLOR_BG);
     }
     draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    present();
 }
 
 static void show_network(void) {
@@ -1007,6 +1329,7 @@ static void show_network(void) {
         draw_string(1, row++, line, COLOR_FG, COLOR_BG);
     }
     draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    present();
 }
 
 static void show_gpu_drm(void) {
@@ -1051,6 +1374,7 @@ static void show_gpu_drm(void) {
         }
     }
     draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    present();
 }
 
 static void show_input_devices(void) {
@@ -1089,6 +1413,7 @@ static void show_input_devices(void) {
         closedir(d);
     }
     draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    present();
 }
 
 static void show_boot_log(void) {
@@ -1108,6 +1433,7 @@ static void show_boot_log(void) {
         draw_string(1, row++, line, COLOR_FG, COLOR_BG);
     }
     draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    present();
 }
 
 static void show_about(void) {
@@ -1134,6 +1460,7 @@ static void show_about(void) {
     for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++)
         draw_string(2, row++, lines[i], COLOR_FG, COLOR_BG);
     draw_string_center(screen_rows - 1, "Press any key to return", COLOR_DIM, COLOR_BG);
+    present();
 }
 
 /* Launch any program under DRM: drop master, exec, wait, re-acquire.
@@ -1145,6 +1472,7 @@ static void run_exec(char *const argv[]) {
     snprintf(splash, sizeof(splash), "Launching %s ...", argv[0]);
     draw_string_center(screen_rows / 2 - 1, splash, COLOR_WARN, COLOR_BG);
     draw_string_center(screen_rows / 2 + 1, "When it exits you return to the console", COLOR_DIM, COLOR_BG);
+    present();
     drmDropMaster(drm_fd);
 
     /* RetroArch's linuxraw input driver starts with isatty(0) and aborts with
@@ -1172,7 +1500,13 @@ static void run_exec(char *const argv[]) {
      * with the seconds elapsed since the fork. */
     const char *lcands[] = { "/mnt/sdcard/retroarch.log", "/sdcard/retroarch.log", NULL };
     int log_fd = -1;
-    for (int i = 0; lcands[i]; i++) {
+    if (cfg.retroarch_log[0]) {
+        log_fd = open(cfg.retroarch_log, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (log_fd < 0)
+            plog("[run] no se pudo abrir %s: %s, candidatas por defecto",
+                 cfg.retroarch_log, strerror(errno));
+    }
+    for (int i = 0; log_fd < 0 && lcands[i]; i++) {
         log_fd = open(lcands[i], O_WRONLY | O_APPEND | O_CREAT, 0644);
         if (log_fd >= 0) break;
     }
@@ -1196,8 +1530,9 @@ static void run_exec(char *const argv[]) {
          * problema de permisos (la SD se monta rw, ver usr/lib/sdcard.sh).
          *
          * Mismo criterio que el log persistente mas arriba: /mnt/sdcard es el p5
-         * exFAT real y el que sobrevive a un reinicio. */
-        setenv("HOME", "/mnt/sdcard", 1);
+         * exFAT real y el que sobrevive a un reinicio. Es el default; en dtc.conf
+         * se puede cambiar con child_home. */
+        setenv("HOME", cfg.child_home, 1);
         if (tty_fd >= 0 && dup2(tty_fd, STDIN_FILENO) < 0)
             plog("[run] dup2 stdin failed: %s", strerror(errno));
         if (pfd[1] >= 0) {
@@ -1290,35 +1625,42 @@ static void run_exec(char *const argv[]) {
 
     /* reacquire DRM master and restore our framebuffer */
     drmSetMaster(drm_fd);
-    drmModeSetCrtc(drm_fd, crtc_id, fb_id, 0, 0, &conn_id, 1, &drm_mode);
+    drmModeSetCrtc(drm_fd, crtc_id, fbs[fb_front].fb_id, 0, 0, &conn_id, 1, &drm_mode);
 }
 
-/* Launch RetroArch (present in the test rootfs, config video_driver=drm). */
-static void run_retroarch(const char *cfg, const char *core, const char *rom) {
+/* Launch RetroArch (present in the test rootfs, config video_driver=drm).
+ * Ojo: el parametro se llama cfgfile y no cfg para no ensombrecer el struct
+ * global cfg (las macros DRM_DEV/GAME_CFG... expanden a cfg.<campo>). */
+static void run_retroarch(const char *cfgfile, const char *core, const char *rom) {
     char core_path[512] = "";
     if (core && core[0]) {
-        /* cores live in either /sdcard/retro_lib or the real exFAT mount */
-        snprintf(core_path, sizeof(core_path), "/sdcard/retro_lib/%s", core);
-        if (access(core_path, R_OK) != 0) {
-            snprintf(core_path, sizeof(core_path), "/mnt/sdcard/retro_lib/%s", core);
-            if (access(core_path, R_OK) != 0) {
-                plog("[ra] core not found: %s", core);
-                return;
-            }
+        /* core_dirs: lista separada por ';' en dtc.conf; default
+         * /sdcard/retro_lib;/mnt/sdcard/retro_lib (el symlink y el mount real) */
+        char dirs[256];
+        snprintf(dirs, sizeof(dirs), "%s", cfg.core_dirs);
+        char *save = NULL;
+        for (char *d = strtok_r(dirs, ";", &save); d; d = strtok_r(NULL, ";", &save)) {
+            snprintf(core_path, sizeof(core_path), "%s/%s", d, core);
+            if (access(core_path, R_OK) == 0) break;
+            core_path[0] = 0;
+        }
+        if (!core_path[0]) {
+            plog("[ra] core not found: %s (dirs: %s)", core, cfg.core_dirs);
+            return;
         }
     }
     char cfg_path[512];
-    if (cfg && cfg[0] && access(cfg, R_OK) == 0)
-        snprintf(cfg_path, sizeof(cfg_path), "%s", cfg);
+    if (cfgfile && cfgfile[0] && access(cfgfile, R_OK) == 0)
+        snprintf(cfg_path, sizeof(cfg_path), "%s", cfgfile);
     else
-        snprintf(cfg_path, sizeof(cfg_path), "/etc/retroarch.cfg");
+        snprintf(cfg_path, sizeof(cfg_path), "%s", cfg.retroarch_cfg);
 
-    /* Si existe /mnt/sdcard/retroarch-extra.cfg se pasa con --appendconfig, de
-     * forma que se pueden cambiar ajustes (audio, menu, latencia) tocando solo
-     * un fichero de la SD, sin reescribir p4 ni recompilar. Los valores de ese
-     * fichero ganan sobre /etc/retroarch.cfg. */
-    const char *extra = "/mnt/sdcard/retroarch-extra.cfg";
-    int has_extra = (access(extra, R_OK) == 0);
+    /* Si existe retroarch_extra (default /mnt/sdcard/retroarch-extra.cfg) se pasa
+     * con --appendconfig, de forma que se pueden cambiar ajustes (audio, menu,
+     * latencia) tocando solo un fichero de la SD, sin reescribir p4 ni
+     * recompilar. Los valores de ese fichero ganan sobre retroarch_cfg. */
+    const char *extra = cfg.retroarch_extra;
+    int has_extra = (extra[0] && access(extra, R_OK) == 0);
     if (has_extra)
         plog("[ra] extra config from SD: %s", extra);
 
@@ -1334,7 +1676,7 @@ static void run_retroarch(const char *cfg, const char *core, const char *rom) {
     {
         char *argv[12];
         int n = 0;
-        argv[n++] = (char *)"/usr/bin/retroarch";
+        argv[n++] = cfg.retroarch_bin;
         argv[n++] = (char *)"--config";
         argv[n++] = cfg_path;
         if (has_extra)
@@ -1372,17 +1714,21 @@ static void run_retroarch(const char *cfg, const char *core, const char *rom) {
 }
 
 /* --- Game Menu: read simple text entries from the sdcard, GRUB-style ---
- * Config file: /mnt/sdcard/drm-text-console.cfg
+ * Config file: GAME_CFG (por defecto /mnt/sdcard/drm-text-console.cfg)
  * Two accepted line formats ('#' = comment, fields separated by '|'):
  *   1) Game:     Name | core_libretro.so | /mnt/sdcard/.../rom.ext
  *   2) Command:  Name | /usr/bin/program [arg1 [arg2 ...]]
  * Example:
  *   Flappy (Intv) | freeintv_libretro.so | /mnt/sdcard/roms/INTV/flappy.int
  *   MiniGUI Demo  | /usr/bin/game
+ * Ruta y pagina (entries per page) configurable via game_cfg / game_page.
+ *
+ * Directiva (linea propia, sin '|'):  autostart = <nombre de entrada>
+ *   Arranca esa entrada al iniciar el binario, saltandose el menu; se resuelve
+ *   con strcasecmp y al salir de la app se vuelve al menu. El nombre debe
+ *   coincidir con el de una entrada; si no, se avisa y se muestra el menu.
  */
-#define GAME_CFG    "/mnt/sdcard/drm-text-console.cfg"
 #define GAME_MAX    256
-#define GAME_PAGE   8                     /* entries per page */
 #define GAME_ARGMAX 16
 static char game_name[GAME_MAX][128];
 static char game_core[GAME_MAX][64];     /* "" for command entries */
@@ -1392,9 +1738,10 @@ static char game_thumb[GAME_MAX][384];   /* optional 4th field: PNG thumb */
 static char *game_argv[GAME_MAX][GAME_ARGMAX + 1];
 static char  game_argv_buf[GAME_MAX][GAME_ARGMAX][128];
 static int   game_count = 0;
+static char  game_autostart[128] = "";   /* '' = sin autostart */
 
 /* Map a libretro core name to a generic per-system thumbnail prefix.
- * Looks for /mnt/sdcard/thumbs/<prefix>.png (fallback No_image.png). */
+ * Looks for THUMB_DIR/<prefix>.png (fallback No_image.png). */
 static const struct { const char *core; const char *sys; } core_sys_map[] = {
     { "freeintv",   "intv" },
     { "stella",     "a26" },
@@ -1414,7 +1761,6 @@ static const struct { const char *core; const char *sys; } core_sys_map[] = {
     { "ppsspp",     "psp" },
     { NULL, NULL },
 };
-#define THUMB_DIR   "/mnt/sdcard/thumbs"
 
 /* Resolve the PNG thumb for an entry. Returns the path to open (static
  * buffer reused), or NULL if none should be drawn. */
@@ -1480,12 +1826,14 @@ static char bg_origen[384] = "";
 static void bg_load(void) {
     if (bg_tried) return;
     bg_tried = 1;
-    static const char *rutas[] = {
-        "/mnt/sdcard/thumbs/fondo.png",
-        "/mnt/sdcard/fondo.png",
-        "/usr/share/drm-text-console/fondo.png",
-    };
-    for (size_t i = 0; i < sizeof(rutas) / sizeof(rutas[0]); i++) {
+    /* cfg.bg_path (dtc.conf) manda si esta definido; despues las 3 de siempre */
+    const char *rutas[4];
+    int total = 0;
+    if (cfg.bg_path[0]) rutas[total++] = cfg.bg_path;
+    rutas[total++] = "/mnt/sdcard/thumbs/fondo.png";
+    rutas[total++] = "/mnt/sdcard/fondo.png";
+    rutas[total++] = "/usr/share/drm-text-console/fondo.png";
+    for (int i = 0; i < total; i++) {
         if (access(rutas[i], R_OK) != 0) continue;
         int w = 0, h = 0;
         if (png_load_rgba(rutas[i], &bg_px, &w, &h) == 0) {
@@ -1502,8 +1850,8 @@ static void bg_load(void) {
 
 /* Atenua el fondo para que el texto se lea encima. 90/255 deja un azul oscuro
  * pero visible: con 150 el fondo salia practically negro y no se distinguia de
- * un fondo liso. Si cambias el fondo y el texto se pierde, sube este valor. */
-#define BG_DIM 90
+ * un fondo liso. Si cambias el fondo y el texto se pierde, sube este valor
+ * (clave bg_dim de dtc.conf, la macro BG_DIM esta arriba con el resto). */
 
 /* El fondo se reescala una sola vez a un canvas 565 y en cada redibujado solo
  * se copia a pantalla. Antes se reescalaba en cada pulsacion de cursor, que a
@@ -1568,17 +1916,49 @@ static int cmd_split(const char *line, char *buf[GAME_ARGMAX + 1],
 
 static int game_load(void) {
     game_count = 0;
+    game_autostart[0] = 0;
     FILE *f = fopen(GAME_CFG, "r");
     if (!f) {
         plog("[game] cannot open %s: %s", GAME_CFG, strerror(errno));
         return -1;
     }
     char line[1024];
+    int nline = 0;
     while (fgets(line, sizeof(line), f) && game_count < GAME_MAX) {
+        nline++;
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0') continue;
         line[strcspn(line, "\r\n")] = 0;   /* strip EOL */
+
+        /* Sin '|' no es una entrada, sino una directiva "clave = valor". La unica
+         * reconocida ahora es autostart = <nombre>; el resto se avisa y se ignora
+         * para no romper el arranque por un typo. */
+        if (!strchr(line, '|')) {
+            char *eq = strchr(line, '=');
+            if (!eq) {
+                plog("[game] %s:%d: linea sin '|' ni '=' (ignorada)", GAME_CFG, nline);
+                continue;
+            }
+            *eq = 0;
+            char *key = line, *val = eq + 1;
+            while (*key == ' ' || *key == '\t') key++;
+            char *tk = strchr(key, '\0') - 1;
+            while (tk >= key && (*tk == ' ' || *tk == '\t')) { *tk = 0; tk--; }
+            while (*val == ' ' || *val == '\t') val++;
+            char *tv = strchr(val, '\0') - 1;
+            while (tv >= val && (*tv == ' ' || *tv == '\t')) { *tv = 0; tv--; }
+            if (!strcmp(key, "autostart")) {
+                if (!val[0])
+                    plog("[game] %s:%d: autostart vacio, se ignora", GAME_CFG, nline);
+                else
+                    snprintf(game_autostart, sizeof(game_autostart), "%s", val);
+            } else {
+                plog("[game] %s:%d: directiva desconocida: %s", GAME_CFG, nline, key);
+            }
+            continue;
+        }
+
         char *n = strtok(line, "|");
         char *c = strtok(NULL, "|");
         char *r = strtok(NULL, "|");
@@ -1638,6 +2018,22 @@ static int game_load(void) {
     return 0;
 }
 
+/* Indice de la entrada cuyo nombre coincide (sin distinguir mayusculas). */
+static int game_find(const char *name) {
+    for (int i = 0; i < game_count; i++)
+        if (!strcasecmp(game_name[i], name)) return i;
+    return -1;
+}
+
+/* Lanza la entrada idx, igual que pulsar Enter en el game menu. */
+static void game_launch(int idx) {
+    if (idx < 0 || idx >= game_count) return;
+    if (game_cmd[idx][0])
+        run_exec(game_argv[idx]);                      /* comando generico */
+    else
+        run_retroarch(NULL, game_core[idx], game_rom[idx]);
+}
+
 static void game_menu(void) {
     if (game_count == 0) game_load();
     if (game_count <= 0) {
@@ -1646,6 +2042,7 @@ static void game_menu(void) {
         draw_string_center(screen_rows / 2 - 2, "No games found in:", COLOR_WARN, COLOR_BG);
         draw_string_center(screen_rows / 2, GAME_CFG, COLOR_FG, COLOR_BG);
         draw_string_center(screen_rows / 2 + 1, "Edit the file or press any key", COLOR_DIM, COLOR_BG);
+        present();
         while (running) {
             if (read_key() >= 0) break;
             usleep(20000);
@@ -1699,6 +2096,7 @@ static void game_menu(void) {
         snprintf(hint, sizeof(hint), "%s",
                  "[Up/Down] Move  [PgUp/PgDn] Page  [Enter] Launch  [Esc] Back");
         draw_string_center(screen_rows - 1, hint, COLOR_FOOT, BG_TRANSPARENT);
+        present();
 
         int k = -1;
         while (k < 0 && running) { k = read_key(); usleep(20000); }
@@ -1707,13 +2105,10 @@ static void game_menu(void) {
                        page = sel / GAME_PAGE; break;
         case VK_DOWN:  if (sel < game_count - 1) sel++; else sel = 0;
                        page = sel / GAME_PAGE; break;
-        case VK_LEFT:  if (page > 0) { page--; sel = page * GAME_PAGE + GAME_PAGE - 1; } break;
-        case VK_RIGHT: if (page < pages - 1) { page++; sel = page * GAME_PAGE; } break;
+        case VK_PGUP: case VK_LEFT:  if (page > 0) { page--; sel = page * GAME_PAGE + GAME_PAGE - 1; } break;
+        case VK_PGDN: case VK_RIGHT: if (page < pages - 1) { page++; sel = page * GAME_PAGE; } break;
         case VK_ENTER:
-            if (game_cmd[sel][0])
-                run_exec(game_argv[sel]);             /* generic command */
-            else
-                run_retroarch(NULL, game_core[sel], game_rom[sel]);
+            game_launch(sel);
             break;
         case VK_ESC:
             return;
@@ -1746,6 +2141,10 @@ int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
     signal(SIGINT, sighandler);
     signal(SIGTERM, sighandler);
+
+    /* Config antes que nada: persist_open() ya usa cfg.persist_log y el resto
+     * del arranque (DRM, layout) lee rutas y ajustes del struct. */
+    cfg_load();
 
     /* Open DRM */
     persist_open();
@@ -1782,13 +2181,30 @@ int main(int argc, char *argv[]) {
         plog("[input] opened %d device(s)", input_count);
     }
 
+    /* Autostart: si drm-text-console.cfg define "autostart = <nombre>", lanza esa
+     * entrada saltandose el menu. Cargamos la lista aqui (antes era perezosa,
+     * solo desde game_menu) para resolver el nombre; el access() evita ensuciar
+     * el log de arranque cuando no hay fichero. Al salir de la app se cae al
+     * menu normal, asi un juego que falle no deja el equipo atrapado. */
+    if (access(GAME_CFG, R_OK) == 0) game_load();
+    if (game_autostart[0]) {
+        int idx = game_find(game_autostart);
+        if (idx >= 0) {
+            plog("[game] autostart: '%s' (entrada %d)", game_autostart, idx);
+            game_launch(idx);
+        } else {
+            plog("[game] autostart '%s' no encontrado; se muestra el menu",
+                 game_autostart);
+        }
+    }
+
     /* Main loop */
     fprintf(stderr, "[menu] Starting menu loop\n");
     draw_menu();
 
     while (running) {
         /* periodic rescan: pick up keyboards/gamepads hotplugged after boot */
-        if (time(NULL) - last_rescan >= 2) {
+        if (time(NULL) - last_rescan >= cfg.input_rescan_s) {
             last_rescan = time(NULL);
             int before = input_count;
             open_input();
@@ -1807,8 +2223,10 @@ int main(int argc, char *argv[]) {
         if (key < 0) { usleep(20000); continue; }
 
         switch (key) {
-        case VK_UP:    menu_sel = (menu_sel - 1 + MENU_COUNT) % MENU_COUNT; draw_menu(); break;
-        case VK_DOWN:  menu_sel = (menu_sel + 1) % MENU_COUNT; draw_menu(); break;
+        case VK_UP: case VK_PGUP:
+            menu_sel = (menu_sel - 1 + MENU_COUNT) % MENU_COUNT; draw_menu(); break;
+        case VK_DOWN: case VK_PGDN:
+            menu_sel = (menu_sel + 1) % MENU_COUNT; draw_menu(); break;
         case VK_LEFT:  menu_sel = (menu_sel - 1 + MENU_COUNT) % MENU_COUNT; draw_menu(); break;
         case VK_RIGHT: menu_sel = (menu_sel + 1) % MENU_COUNT; draw_menu(); break;
         case VK_ENTER:
